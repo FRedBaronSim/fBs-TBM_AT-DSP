@@ -1,5 +1,23 @@
 // ====================================================================
-// FBSiM AT-DSP v0.4.4 — Encoder detent ratio corrected after hardware verify
+// FBSiM AT-DSP v0.5.0 — 7-field protocol + preselected stacked-bug render
+//
+// Changes from v0.4.4:
+//   - Protocol: compound @ATD: state is now 7 fields (added `preselected`
+//     between `target` and `ias`). Parser extended with one extra strtok.
+//   - DisplayState + DemoFrame carry a new `preselected` int alongside
+//     the existing `target` (active).
+//   - New render_preselect() helper — Proposal C stacked-bug layout.
+//     Shows dim preselect digits above a gray separator whenever
+//     target != preselected; fully hides both when matched.
+//   - Preselect color matches active mode: COLOR_CYAN_DIM (MAN),
+//     COLOR_MAGENTA_DIM (FLC), COLOR_GRAY_LT (ARMED and fallback).
+//   - Subtle flash of preselect digits at 600 ms cadence while differing.
+//   - Layout Y-coords retuned to make room for the new preselect cell:
+//     MODE_Y 16→14, TGT_CELL_H 60→55, TGT_Y 50→40, PHASE_Y 120→152,
+//     CUR_Y 140→168, ENG_DOT_Y 180→199, NODATA_Y 210→218.
+//   - Dirty-tracked render() extended: re-renders preselect on
+//     state/target/preselected change or flash-visibility toggle.
+//   - Demo sequence exercises the new preselect visual.
 //
 // Changes from v0.4.3:
 //   - DETENTS_PER_COUNT 4→2: E37 variant in use emits 2 pulses per detent,
@@ -20,7 +38,7 @@
 #include <HardwareTimer.h>
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.4.4";
+static const char* FW_VERSION = "0.5.0";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -44,7 +62,9 @@ SPISettings spiSettings(10000000, MSBFIRST, SPI_MODE0);
 #define COLOR_BLACK    0x0000
 #define COLOR_WHITE    0xFFFF
 #define COLOR_CYAN     0x07FF
+#define COLOR_CYAN_DIM    0x043F   // preselect cyan (MAN preselect)
 #define COLOR_MAGENTA  0xF81F
+#define COLOR_MAGENTA_DIM 0x780F   // preselect magenta (FLC preselect)
 #define COLOR_GREEN    0x07E0
 #define COLOR_AMBER    0xFD20   // G3000 caution amber
 #define COLOR_RED      0xF800
@@ -61,6 +81,7 @@ static const uint32_t TIMEOUT_MS               = 5000;   // PC silent → NO DAT
 static const uint32_t DEMO_START_IF_NO_PC_MS   = 10000;  // no PC ever → demo
 static const uint32_t ENCODER_POLL_MS          = 2;      // hardware counter poll
 static const uint32_t BUTTON_DEBOUNCE_MS       = 20;
+static const uint32_t FLASH_INTERVAL_MS        = 600;    // preselect flash cadence
 
 // ---- Serial buffer -----------------------------------------------
 static const int SERIAL_RX_BUF = 128;
@@ -358,43 +379,60 @@ void draw_string_centered(int16_t cx, int16_t y, const char* s, uint8_t scale,
 struct DisplayState {
     char state[8];   // OFF, ARMED, MAN, FLC, TO, GA
     char mode[8];    // MAN, FLC, -
-    int  target;
+    int  target;       // active (committed) value
+    int  preselected;  // pilot-dialed, uncommitted value (v0.5.0)
     int  ias;
     char phase[12];
     char envelope[8];
     bool no_data;    // overlay NO DATA on top of last state
 };
 
-DisplayState cur_state  = {"OFF", "-", 0, 0, "OFF", "OK", false};
-DisplayState prev_state = {"----", "-", -1, -1, "----", "----", true};  // force initial redraw
+DisplayState cur_state  = {"OFF",  "-",  0,  0,  0,  "OFF",  "OK",   false};
+DisplayState prev_state = {"----", "-", -1, -1, -1, "----", "----", true};  // force initial redraw
+
+// Preselect flash state (v0.5.0) — placed here so render_preselect() sees them
+uint32_t preselect_flash_toggle_ms = 0;
+bool     preselect_flash_visible   = true;
+bool     rendered_flash_state      = true;   // what render_preselect last drew
 
 // ====================================================================
-// LAYOUT CONSTANTS (v0.4.1 retuned for phase row)
+// LAYOUT CONSTANTS (v0.5.0 retuned to make room for preselect cell)
 // ====================================================================
-#define MODE_Y            16      // mode label (scale 3)
+#define MODE_Y            14      // was 16 — nudged up for preselect
 #define MODE_SCALE        3
 #define MODE_H_PX         (MODE_SCALE * 7)   // 21
 
 #define TGT_CELL_W        40
-#define TGT_CELL_H        60      // was 64 — trimmed to make room
+#define TGT_CELL_H        55      // was 60
 #define TGT_CELL_T        8
 #define TGT_SPACING       10
-#define TGT_Y             50      // was 78
+#define TGT_Y             40      // was 50
 #define TGT_RIGHT_X       190
 
-#define PHASE_Y           120     // NEW — phase label, small, dim white
+// Preselect row (NEW — v0.5.0, Proposal C stacked-bug)
+#define SEPARATOR_Y       100
+#define SEPARATOR_W       120
+#define SEPARATOR_H       3
+#define PRESEL_CELL_W     28
+#define PRESEL_CELL_H     38
+#define PRESEL_CELL_T     5
+#define PRESEL_SPACING    7
+#define PRESEL_Y          110
+#define PRESEL_RIGHT_X    167
+
+#define PHASE_Y           152     // was 120
 #define PHASE_SCALE       1
 #define PHASE_H_PX        7
 
-#define CUR_Y             140     // was 160
+#define CUR_Y             168     // was 140
 #define CUR_SCALE         2
 #define CUR_H_PX          (CUR_SCALE * 7)    // 14
 
-#define ENG_DOT_Y         180     // was 200
+#define ENG_DOT_Y         199     // was 180
 #define ENG_DOT_R         4
 #define ENG_LBL_SCALE     2
 
-#define NODATA_Y          210     // was 220
+#define NODATA_Y          218     // was 210
 #define NODATA_SCALE      1
 
 // ====================================================================
@@ -501,17 +539,51 @@ void render_no_data(const struct DisplayState& s) {
     }
 }
 
+void render_preselect(const struct DisplayState& s) {
+    int16_t total_w = 3 * PRESEL_CELL_W + 2 * PRESEL_SPACING;
+    int16_t left_x  = PRESEL_RIGHT_X - total_w;
+
+    // Matched case: hide preselect digits AND separator entirely
+    if (s.target == s.preselected) {
+        tft_fill_rect(left_x, PRESEL_Y, total_w, PRESEL_CELL_H, COLOR_BLACK);
+        tft_fill_rect(60, SEPARATOR_Y, SEPARATOR_W, SEPARATOR_H, COLOR_BLACK);
+        return;
+    }
+
+    // Values differ: separator always visible, digits obey flash visibility
+    tft_fill_rect(60, SEPARATOR_Y, SEPARATOR_W, SEPARATOR_H, COLOR_GRAY_DK);
+
+    // Preselect color tracks active mode (dim variant)
+    uint16_t color;
+    if      (!strcmp(s.state, "MAN"))   color = COLOR_CYAN_DIM;
+    else if (!strcmp(s.state, "FLC"))   color = COLOR_MAGENTA_DIM;
+    else if (!strcmp(s.state, "ARMED")) color = COLOR_GRAY_LT;
+    else                                color = COLOR_GRAY_LT;  // OFF/TO/GA fallback
+
+    if (preselect_flash_visible) {
+        draw_7seg_number(PRESEL_RIGHT_X, PRESEL_Y,
+                         PRESEL_CELL_W, PRESEL_CELL_H, PRESEL_CELL_T,
+                         PRESEL_SPACING, s.preselected, 3,
+                         color, COLOR_BLACK);
+    } else {
+        // Flash off phase: erase digits only; separator stays drawn
+        tft_fill_rect(left_x, PRESEL_Y, total_w, PRESEL_CELL_H, COLOR_BLACK);
+    }
+}
+
 // --- Top-level render orchestrator with dirty tracking ------------
 
 void render(const struct DisplayState& s, const struct DisplayState& prev) {
     // Compute per-region dirty flags
-    bool state_changed    = strcmp(s.state, prev.state) != 0;
-    bool mode_changed     = strcmp(s.mode, prev.mode) != 0;
-    bool target_changed   = s.target != prev.target;
-    bool ias_changed      = s.ias != prev.ias;
-    bool phase_changed    = strcmp(s.phase, prev.phase) != 0;
-    bool envelope_changed = strcmp(s.envelope, prev.envelope) != 0;
-    bool nodata_changed   = s.no_data != prev.no_data;
+    bool state_changed        = strcmp(s.state, prev.state) != 0;
+    bool mode_changed         = strcmp(s.mode, prev.mode) != 0;
+    bool target_changed       = s.target != prev.target;
+    bool preselected_changed  = s.preselected != prev.preselected;
+    bool ias_changed          = s.ias != prev.ias;
+    bool phase_changed        = strcmp(s.phase, prev.phase) != 0;
+    bool envelope_changed     = strcmp(s.envelope, prev.envelope) != 0;
+    bool nodata_changed       = s.no_data != prev.no_data;
+    bool flash_dirty          = preselect_flash_visible != rendered_flash_state;
 
     // Mode label — redraw on state change (color + label content both depend on state)
     if (state_changed) {
@@ -521,6 +593,12 @@ void render(const struct DisplayState& s, const struct DisplayState& prev) {
     // Target digits — redraw on state, target, or envelope change (color shift on envelope)
     if (state_changed || target_changed || envelope_changed) {
         render_target_digits(s);
+    }
+
+    // Preselect — redraw on state/target/preselected change or flash toggle
+    if (state_changed || target_changed || preselected_changed || flash_dirty) {
+        render_preselect(s);
+        rendered_flash_state = preselect_flash_visible;
     }
 
     // Phase row — redraw on phase or state change (hidden in OFF/ARMED)
@@ -632,11 +710,12 @@ void emit_error(const char* code) {
 
 // ====================================================================
 // PROTOCOL PARSER — compound @ATD: state messages
-// Format: @ATD:<state>,<mode>,<target>,<ias>,<phase>,<envelope>\n
+// Format (v0.5.0, 7 fields):
+//   @ATD:<state>,<mode>,<active>,<preselected>,<ias>,<phase>,<envelope>\n
 // ====================================================================
 bool parse_compound_state(const char* msg) {
     // msg starts after "@ATD:"
-    // Example: "OFF,MAN,120,145,OFF,OK"
+    // Example: "MAN,MAN,180,195,175,CRUISE,OK"
     char buf[128];
     strncpy(buf, msg, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = 0;
@@ -654,6 +733,10 @@ bool parse_compound_state(const char* msg) {
     tok = strtok(NULL, ",");
     if (!tok) return false;
     cur_state.target = atoi(tok);
+
+    tok = strtok(NULL, ",");
+    if (!tok) return false;
+    cur_state.preselected = atoi(tok);
 
     tok = strtok(NULL, ",");
     if (!tok) return false;
@@ -734,22 +817,28 @@ void serial_poll() {
 // ====================================================================
 struct DemoFrame {
     const char* state; const char* mode;
-    int target; int ias;
+    int target; int preselected; int ias;
     const char* phase; const char* envelope;
     uint32_t hold_ms;
 };
 const DemoFrame demo_seq[] = {
-    {"OFF",   "-",   0,   0,   "OFF",    "OK",  1500},
-    {"ARMED", "MAN", 180, 120, "OFF",    "OK",  2500},   // NEW — shows ARMED distinct
-    {"MAN",   "MAN", 120, 75,  "CLIMB",  "OK",  2500},
-    {"MAN",   "MAN", 140, 118, "CLIMB",  "OK",  2500},
-    {"FLC",   "FLC", 180, 165, "CLIMB",  "OK",  2500},
-    {"FLC",   "FLC", 220, 198, "CRUISE", "OK",  2500},
-    {"FLC",   "FLC", 220, 235, "CRUISE", "OVR", 2500},   // envelope alert
-    {"TO",    "-",   110, 95,  "TOGA",   "OK",  2500},
-    {"GA",    "-",   130, 115, "GA",     "OK",  2500},
-    {"ARMED", "FLC", 200, 210, "OFF",    "OK",  2500},   // NEW — second ARMED variant
-    {"OFF",   "-",   0,   165, "OFF",    "OK",  2000},
+    // Existing frames — preselected = target so no stacked bug
+    {"OFF",   "-",   0,   0,   0,   "OFF",    "OK",  1500},
+    {"ARMED", "MAN", 180, 180, 120, "OFF",    "OK",  2500},
+    {"MAN",   "MAN", 120, 120, 75,  "CLIMB",  "OK",  2500},
+    {"MAN",   "MAN", 140, 140, 118, "CLIMB",  "OK",  2500},
+    {"FLC",   "FLC", 180, 180, 165, "CLIMB",  "OK",  2500},
+    {"FLC",   "FLC", 220, 220, 198, "CRUISE", "OK",  2500},
+    {"FLC",   "FLC", 220, 220, 235, "CRUISE", "OVR", 2500},   // envelope alert
+    {"TO",    "-",   110, 110, 95,  "TOGA",   "OK",  2500},
+    {"GA",    "-",   130, 130, 115, "GA",     "OK",  2500},
+    {"ARMED", "FLC", 200, 200, 210, "OFF",    "OK",  2500},
+    {"OFF",   "-",   0,   0,   165, "OFF",    "OK",  2000},
+    // v0.5.0 — exercise preselect visual (target != preselected)
+    {"MAN",   "MAN", 180, 195, 175, "CRUISE", "OK",  2500},
+    {"MAN",   "MAN", 195, 195, 192, "CRUISE", "OK",  2000},
+    {"FLC",   "FLC", 220, 240, 235, "CRUISE", "OVR", 2500},
+    {"ARMED", "MAN", 180, 195, 175, "OFF",    "OK",  2500},
 };
 const int demo_count = sizeof(demo_seq) / sizeof(DemoFrame);
 
@@ -757,8 +846,9 @@ void apply_demo_frame(int idx) {
     const DemoFrame& f = demo_seq[idx];
     strncpy(cur_state.state,    f.state,    sizeof(cur_state.state) - 1);
     strncpy(cur_state.mode,     f.mode,     sizeof(cur_state.mode) - 1);
-    cur_state.target = f.target;
-    cur_state.ias    = f.ias;
+    cur_state.target      = f.target;
+    cur_state.preselected = f.preselected;
+    cur_state.ias         = f.ias;
     strncpy(cur_state.phase,    f.phase,    sizeof(cur_state.phase) - 1);
     strncpy(cur_state.envelope, f.envelope, sizeof(cur_state.envelope) - 1);
 }
@@ -850,6 +940,13 @@ void loop() {
         poll_encoders();
     }
 
+    // --- Preselect flash toggle ----------------------------------
+    if (cur_state.target != cur_state.preselected &&
+        now - preselect_flash_toggle_ms >= FLASH_INTERVAL_MS) {
+        preselect_flash_visible = !preselect_flash_visible;
+        preselect_flash_toggle_ms = now;
+    }
+
     // --- Button debounce -----------------------------------------
     int raw = digitalRead(BTN_PIN);
     if (raw != last_btn_state) {
@@ -898,11 +995,13 @@ void loop() {
     bool changed =
         strcmp(cur_state.state,    prev_state.state)    != 0 ||
         strcmp(cur_state.mode,     prev_state.mode)     != 0 ||
-        cur_state.target != prev_state.target ||
-        cur_state.ias    != prev_state.ias    ||
+        cur_state.target      != prev_state.target      ||
+        cur_state.preselected != prev_state.preselected ||
+        cur_state.ias         != prev_state.ias         ||
         strcmp(cur_state.phase,    prev_state.phase)    != 0 ||
         strcmp(cur_state.envelope, prev_state.envelope) != 0 ||
-        cur_state.no_data != prev_state.no_data;
+        cur_state.no_data != prev_state.no_data ||
+        preselect_flash_visible != rendered_flash_state;
 
     if (changed) {
         // Drain any detents that arrived during the prior render
