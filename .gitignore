@@ -9,3 +9,5 @@ build/
 Thumbs.db
 .DS_Store
 .claude/
+# Abandoned USB VID/PID override attempt (see chat history 2026-04-22)
+FBSiM_ATDSP/build_opt.h
