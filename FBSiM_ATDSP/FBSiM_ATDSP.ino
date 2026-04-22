@@ -1,5 +1,12 @@
 // ====================================================================
-// FBSiM AT-DSP v0.5.1 — Proposal D layout redesign + screen modes + logo
+// FBSiM AT-DSP v0.5.2 — banner clipping fix (adaptive scale)
+//
+// Changes from v0.5.1:
+//   - MODE_Y 14→18 (banner shifted down, opens horizontal budget
+//     against the round display bezel at the chord width).
+//   - Adaptive banner scale for 6+ char strings — TO ARM and GA ARM
+//     now render at scale 3; shorter banners (SPD, FLC, ARMED, TO, GA)
+//     stay at scale 4 (MODE_SCALE).
 //
 // Changes from v0.5.0:
 //   - Complete layout redesign (Proposal D):
@@ -64,7 +71,7 @@ enum ScreenMode {
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.1";
+static const char* FW_VERSION = "0.5.2";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -443,7 +450,7 @@ static uint32_t   boot_screen_start_ms = 0;     // set in setup()
 // ====================================================================
 // LAYOUT CONSTANTS (v0.5.1 Proposal D)
 // ====================================================================
-#define MODE_Y            14
+#define MODE_Y            18
 #define MODE_SCALE        4                   // was 3 — bigger banner
 #define MODE_H_PX         (MODE_SCALE * 7)    // 28
 
@@ -589,7 +596,8 @@ void render_mode_label(const struct DisplayState& s) {
     derive_banner_text(s, text, &color);
     tft_fill_rect(0, MODE_Y - 2, 240, MODE_H_PX + 4, COLOR_BLACK);
     if (text[0]) {
-        draw_string_centered(120, MODE_Y, text, MODE_SCALE, color, COLOR_BLACK);
+        uint8_t scale = (strlen(text) >= 6) ? 3 : MODE_SCALE;
+        draw_string_centered(120, MODE_Y, text, scale, color, COLOR_BLACK);
     }
 }
 
