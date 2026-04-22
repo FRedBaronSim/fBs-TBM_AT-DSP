@@ -1,6 +1,9 @@
 // ====================================================================
-// FBSiM AT-DSP v0.4.3 — Compile fix: auto-prototype rule applied to all
-//                       per-region render helpers
+// FBSiM AT-DSP v0.4.4 — Encoder detent ratio corrected after hardware verify
+//
+// Changes from v0.4.3:
+//   - DETENTS_PER_COUNT 4→2: E37 variant in use emits 2 pulses per detent,
+//     not 4 (verified on hardware 2026-04-22 — was emitting 1 event per 2 clicks)
 //
 // Changes from v0.4.2:
 //   - render_mode_label / render_target_digits / render_phase / render_ias /
@@ -17,7 +20,7 @@
 #include <HardwareTimer.h>
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.4.3";
+static const char* FW_VERSION = "0.4.4";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -49,9 +52,8 @@ SPISettings spiSettings(10000000, MSBFIRST, SPI_MODE0);
 #define COLOR_GRAY_DK  0x4208
 
 // ---- Encoder tuning ----------------------------------------------
-// x4 quadrature decoding — 4 counts per mechanical detent on most E37s.
-// If your unit reads 2 detents per click, change to 2.
-static const int DETENTS_PER_COUNT = 4;
+// E37 variant in use = 2 pulses per detent (verified on hardware 2026-04-22)
+static const int DETENTS_PER_COUNT = 2;
 
 // ---- Timings ------------------------------------------------------
 static const uint32_t HEARTBEAT_INTERVAL_MS    = 2000;   // send @ATD:ACK

@@ -1,0 +1,38 @@
+warning: in the working copy of 'FBSiM_ATDSP/FBSiM_ATDSP.ino', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/FBSiM_ATDSP/FBSiM_ATDSP.ino b/FBSiM_ATDSP/FBSiM_ATDSP.ino[m
+[1mindex f1883f1..b1241d0 100644[m
+[1m--- a/FBSiM_ATDSP/FBSiM_ATDSP.ino[m
+[1m+++ b/FBSiM_ATDSP/FBSiM_ATDSP.ino[m
+[36m@@ -1,6 +1,9 @@[m
+ // ====================================================================[m
+[31m-// FBSiM AT-DSP v0.4.3 — Compile fix: auto-prototype rule applied to all[m
+[31m-//                       per-region render helpers[m
+[32m+[m[32m// FBSiM AT-DSP v0.4.4 — Encoder detent ratio corrected after hardware verify[m
+[32m+[m[32m//[m
+[32m+[m[32m// Changes from v0.4.3:[m
+[32m+[m[32m//   - DETENTS_PER_COUNT 4→2: E37 variant in use emits 2 pulses per detent,[m
+[32m+[m[32m//     not 4 (verified on hardware 2026-04-22 — was emitting 1 event per 2 clicks)[m
+ //[m
+ // Changes from v0.4.2:[m
+ //   - render_mode_label / render_target_digits / render_phase / render_ias /[m
+[36m@@ -17,7 +20,7 @@[m
+ #include <HardwareTimer.h>[m
+ [m
+ // ---- Version ------------------------------------------------------[m
+[31m-static const char* FW_VERSION = "0.4.3";[m
+[32m+[m[32mstatic const char* FW_VERSION = "0.4.4";[m
+ [m
+ // ---- Display pins -------------------------------------------------[m
+ #define TFT_CS   PA3[m
+[36m@@ -49,9 +52,8 @@[m [mSPISettings spiSettings(10000000, MSBFIRST, SPI_MODE0);[m
+ #define COLOR_GRAY_DK  0x4208[m
+ [m
+ // ---- Encoder tuning ----------------------------------------------[m
+[31m-// x4 quadrature decoding — 4 counts per mechanical detent on most E37s.[m
+[31m-// If your unit reads 2 detents per click, change to 2.[m
+[31m-static const int DETENTS_PER_COUNT = 4;[m
+[32m+[m[32m// E37 variant in use = 2 pulses per detent (verified on hardware 2026-04-22)[m
+[32m+[m[32mstatic const int DETENTS_PER_COUNT = 2;[m
+ [m
+ // ---- Timings ------------------------------------------------------[m
+ static const uint32_t HEARTBEAT_INTERVAL_MS    = 2000;   // send @ATD:ACK[m
