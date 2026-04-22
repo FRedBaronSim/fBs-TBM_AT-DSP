@@ -104,11 +104,23 @@ PC emits compound:
 
 &#x20;  back. Do not add autonomous mode/target mutation in the board.
 
-8\. Arduino IDE auto-prototype bug: any function using user-defined struct
+8\. Arduino IDE auto-prototype bug: the IDE auto-generates function
 
-&#x20;  type needs `const struct TypeName\&` in signature, not just
+&#x20;  prototypes at the top of the .ino file, so those prototypes cannot
 
-&#x20;  `const TypeName\&`. Applies to DisplayState, Glyph, any future structs.
+&#x20;  reference user-defined types declared later in the file. Preferred
+
+&#x20;  fix: declare any user-defined struct or enum used in a function
+
+&#x20;  signature at the top of the .ino file, after the includes (applies
+
+&#x20;  to ScreenMode and any future types). Legacy workaround for existing
+
+&#x20;  struct signatures (DisplayState, Glyph): write `const struct
+
+&#x20;  TypeName\&` instead of `const TypeName\&`. Leave those in place;
+
+&#x20;  prefer the top-declaration approach for any new types.
 
 
 

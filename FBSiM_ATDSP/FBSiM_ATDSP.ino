@@ -55,6 +55,14 @@
 #include <HardwareTimer.h>
 #include "logo_bitmap.h"
 
+// Declared at file top so Arduino IDE auto-prototypes can resolve the type
+enum ScreenMode {
+    SCREEN_BOOT      = 0,   // logo-only, first BOOT_SCREEN_MS after power-on
+    SCREEN_NO_DATA   = 1,   // PC App silent or never connected
+    SCREEN_OFF       = 2,   // PC App reported state=OFF
+    SCREEN_MAIN      = 3    // normal operation (Proposal D layout)
+};
+
 // ---- Version ------------------------------------------------------
 static const char* FW_VERSION = "0.5.1";
 
@@ -427,13 +435,7 @@ uint32_t preselect_flash_toggle_ms = 0;
 bool     preselect_flash_visible   = true;
 bool     rendered_flash_state      = true;   // what render_preselect last drew
 
-// Screen-mode state machine (v0.5.1) — placed here so render() / loop() see it
-enum ScreenMode {
-    SCREEN_BOOT      = 0,   // logo-only, first BOOT_SCREEN_MS after power-on
-    SCREEN_NO_DATA   = 1,   // PC App silent or never connected
-    SCREEN_OFF       = 2,   // PC App reported state=OFF
-    SCREEN_MAIN      = 3    // normal operation (Proposal D layout)
-};
+// Screen-mode state machine (v0.5.1) — enum declared at file top
 static ScreenMode current_screen      = SCREEN_BOOT;
 static ScreenMode prev_screen         = SCREEN_BOOT;
 static uint32_t   boot_screen_start_ms = 0;     // set in setup()
