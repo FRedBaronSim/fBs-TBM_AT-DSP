@@ -1,23 +1,40 @@
 // ====================================================================
-// FBSiM AT-DSP v0.5.0 — 7-field protocol + preselected stacked-bug render
+// FBSiM AT-DSP v0.5.1 — Proposal D layout redesign + screen modes + logo
+//
+// Changes from v0.5.0:
+//   - Complete layout redesign (Proposal D):
+//     * Banner scale 3→4 (bigger, more prominent)
+//     * Phase scale 1→3 (much more visible; draw_char is integer-scale only)
+//     * NEW engagement text region at bottom (ENGAGED / ARMED / OFF)
+//   - Screen mode state machine: BOOT / NO_DATA / OFF / MAIN.
+//     Transitions full-erase and redraw; per-region dirty-tracking runs
+//     only while on SCREEN_MAIN.
+//   - NO DATA is now a full-screen takeover (was an overlay in v0.5.0).
+//   - Boot splash shows theFBSiM logo (logo_bitmap.h, 180x115 RGB565)
+//     centered for the first BOOT_SCREEN_MS (2000ms).
+//   - OFF state shows solid black screen (per TBM 940 behavior).
+//   - Banner logic now reads state+phase combo:
+//       state=ARMED + phase=TOGA → "TO ARM" amber
+//       state=ARMED + phase=GA   → "GA ARM" amber
+//     (falls through to plain "ARMED" if PC App does not populate phase.)
+//   - FLC preselect color: dim magenta → light gray (readability fix).
+//   - Demo mode removed entirely — NO DATA screen replaces the "no PC
+//     App yet" visual. Board is pure DUMB I/O per spec rule #7.
+//   - New helpers: tft_write_pixels_bulk (logo burst), render_logo,
+//     render_boot_screen / render_no_data_screen / render_off_screen,
+//     derive_banner_text, derive_engagement_text, decide_screen_mode,
+//     render_main_screen_full.
+//   - Protocol unchanged: still 7-field v0.5.0 format.
 //
 // Changes from v0.4.4:
 //   - Protocol: compound @ATD: state is now 7 fields (added `preselected`
 //     between `target` and `ias`). Parser extended with one extra strtok.
-//   - DisplayState + DemoFrame carry a new `preselected` int alongside
+//   - DisplayState carries a new `preselected` int alongside
 //     the existing `target` (active).
-//   - New render_preselect() helper — Proposal C stacked-bug layout.
+//   - render_preselect() helper — Proposal C stacked-bug layout.
 //     Shows dim preselect digits above a gray separator whenever
 //     target != preselected; fully hides both when matched.
-//   - Preselect color matches active mode: COLOR_CYAN_DIM (MAN),
-//     COLOR_MAGENTA_DIM (FLC), COLOR_GRAY_LT (ARMED and fallback).
 //   - Subtle flash of preselect digits at 600 ms cadence while differing.
-//   - Layout Y-coords retuned to make room for the new preselect cell:
-//     MODE_Y 16→14, TGT_CELL_H 60→55, TGT_Y 50→40, PHASE_Y 120→152,
-//     CUR_Y 140→168, ENG_DOT_Y 180→199, NODATA_Y 210→218.
-//   - Dirty-tracked render() extended: re-renders preselect on
-//     state/target/preselected change or flash-visibility toggle.
-//   - Demo sequence exercises the new preselect visual.
 //
 // Changes from v0.4.3:
 //   - DETENTS_PER_COUNT 4→2: E37 variant in use emits 2 pulses per detent,
@@ -36,9 +53,10 @@
 
 #include <SPI.h>
 #include <HardwareTimer.h>
+#include "logo_bitmap.h"
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.0";
+static const char* FW_VERSION = "0.5.1";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -64,7 +82,6 @@ SPISettings spiSettings(10000000, MSBFIRST, SPI_MODE0);
 #define COLOR_CYAN     0x07FF
 #define COLOR_CYAN_DIM    0x043F   // preselect cyan (MAN preselect)
 #define COLOR_MAGENTA  0xF81F
-#define COLOR_MAGENTA_DIM 0x780F   // preselect magenta (FLC preselect)
 #define COLOR_GREEN    0x07E0
 #define COLOR_AMBER    0xFD20   // G3000 caution amber
 #define COLOR_RED      0xF800
@@ -78,10 +95,10 @@ static const int DETENTS_PER_COUNT = 2;
 // ---- Timings ------------------------------------------------------
 static const uint32_t HEARTBEAT_INTERVAL_MS    = 2000;   // send @ATD:ACK
 static const uint32_t TIMEOUT_MS               = 5000;   // PC silent → NO DATA
-static const uint32_t DEMO_START_IF_NO_PC_MS   = 10000;  // no PC ever → demo
 static const uint32_t ENCODER_POLL_MS          = 2;      // hardware counter poll
 static const uint32_t BUTTON_DEBOUNCE_MS       = 20;
 static const uint32_t FLASH_INTERVAL_MS        = 600;    // preselect flash cadence
+#define BOOT_SCREEN_MS 2000                              // logo-only startup hold
 
 // ---- Serial buffer -----------------------------------------------
 static const int SERIAL_RX_BUF = 128;
@@ -106,6 +123,21 @@ void tft_write_data16(uint16_t d) {
     tft_dc_data(); tft_cs_low();
     SPI.transfer(d >> 8); SPI.transfer(d & 0xFF);
     tft_cs_high();
+}
+
+// Bulk 16-bit-per-pixel burst. Caller must have set the draw window first.
+// Single SPI transaction + CS-low for the whole run — much faster than
+// per-pixel tft_write_data16 for logo-sized blits.
+void tft_write_pixels_bulk(const uint16_t* data, uint32_t count) {
+    SPI.beginTransaction(spiSettings);
+    tft_dc_data(); tft_cs_low();
+    for (uint32_t i = 0; i < count; i++) {
+        uint16_t p = data[i];
+        SPI.transfer(p >> 8);
+        SPI.transfer(p & 0xFF);
+    }
+    tft_cs_high();
+    SPI.endTransaction();
 }
 
 void tft_init_hw() {
@@ -395,45 +427,53 @@ uint32_t preselect_flash_toggle_ms = 0;
 bool     preselect_flash_visible   = true;
 bool     rendered_flash_state      = true;   // what render_preselect last drew
 
+// Screen-mode state machine (v0.5.1) — placed here so render() / loop() see it
+enum ScreenMode {
+    SCREEN_BOOT      = 0,   // logo-only, first BOOT_SCREEN_MS after power-on
+    SCREEN_NO_DATA   = 1,   // PC App silent or never connected
+    SCREEN_OFF       = 2,   // PC App reported state=OFF
+    SCREEN_MAIN      = 3    // normal operation (Proposal D layout)
+};
+static ScreenMode current_screen      = SCREEN_BOOT;
+static ScreenMode prev_screen         = SCREEN_BOOT;
+static uint32_t   boot_screen_start_ms = 0;     // set in setup()
+
 // ====================================================================
-// LAYOUT CONSTANTS (v0.5.0 retuned to make room for preselect cell)
+// LAYOUT CONSTANTS (v0.5.1 Proposal D)
 // ====================================================================
-#define MODE_Y            14      // was 16 — nudged up for preselect
-#define MODE_SCALE        3
-#define MODE_H_PX         (MODE_SCALE * 7)   // 21
+#define MODE_Y            14
+#define MODE_SCALE        4                   // was 3 — bigger banner
+#define MODE_H_PX         (MODE_SCALE * 7)    // 28
 
 #define TGT_CELL_W        40
-#define TGT_CELL_H        55      // was 60
+#define TGT_CELL_H        50                  // was 55
 #define TGT_CELL_T        8
 #define TGT_SPACING       10
-#define TGT_Y             40      // was 50
+#define TGT_Y             46                  // was 40 — nudged for banner growth
 #define TGT_RIGHT_X       190
 
-// Preselect row (NEW — v0.5.0, Proposal C stacked-bug)
-#define SEPARATOR_Y       100
+// Preselect row (v0.5.0 Proposal C stacked-bug, slightly retuned in v0.5.1)
+#define SEPARATOR_Y       101                 // was 100
 #define SEPARATOR_W       120
 #define SEPARATOR_H       3
 #define PRESEL_CELL_W     28
-#define PRESEL_CELL_H     38
+#define PRESEL_CELL_H     34                  // was 38
 #define PRESEL_CELL_T     5
 #define PRESEL_SPACING    7
 #define PRESEL_Y          110
 #define PRESEL_RIGHT_X    167
 
-#define PHASE_Y           152     // was 120
-#define PHASE_SCALE       1
-#define PHASE_H_PX        7
+#define PHASE_Y           150                 // was 152
+#define PHASE_SCALE       3                   // was 1 — much more visible
+#define PHASE_H_PX        (PHASE_SCALE * 7)
 
-#define CUR_Y             168     // was 140
+#define CUR_Y             176                 // was 168
 #define CUR_SCALE         2
-#define CUR_H_PX          (CUR_SCALE * 7)    // 14
+#define CUR_H_PX          (CUR_SCALE * 7)
 
-#define ENG_DOT_Y         199     // was 180
-#define ENG_DOT_R         4
-#define ENG_LBL_SCALE     2
-
-#define NODATA_Y          218     // was 210
-#define NODATA_SCALE      1
+// Engagement text (v0.5.1 — replaces the dot + label from v0.5.0)
+#define ENG_TEXT_Y        200
+#define ENG_TEXT_SCALE    2
 
 // ====================================================================
 // RENDERING (v0.4.1 — per-region dirty tracking, no full wipes)
@@ -456,19 +496,99 @@ bool state_is_armed(const char* s) {
     return !strcmp(s, "ARMED");
 }
 
-// Substitute "SPD" for MAN when rendering (real TBM 940 labels it SPD)
-const char* display_label(const char* s) {
-    if (!strcmp(s, "MAN")) return "SPD";
-    return s;
+// --- Banner / engagement text derivation (v0.5.1) -----------------
+
+// Derives the top-banner text + color from the state+phase combination.
+// ARMED+TOGA and ARMED+GA get a distinct amber "TO ARM" / "GA ARM" banner
+// so the pilot can see the pre-engaged takeoff/go-around arming state
+// without having to cross-reference the phase line.
+void derive_banner_text(const struct DisplayState& s,
+                        char* out_text, uint16_t* out_color) {
+    if (!strcmp(s.state, "MAN")) {
+        strcpy(out_text, "SPD");
+        *out_color = COLOR_CYAN;
+    } else if (!strcmp(s.state, "FLC")) {
+        strcpy(out_text, "FLC");
+        *out_color = COLOR_MAGENTA;
+    } else if (!strcmp(s.state, "TO")) {
+        strcpy(out_text, "TO");
+        *out_color = COLOR_GREEN;
+    } else if (!strcmp(s.state, "GA")) {
+        strcpy(out_text, "GA");
+        *out_color = COLOR_GREEN;
+    } else if (!strcmp(s.state, "ARMED")) {
+        if (!strcmp(s.phase, "TOGA")) {
+            strcpy(out_text, "TO ARM");
+            *out_color = COLOR_AMBER;
+        } else if (!strcmp(s.phase, "GA")) {
+            strcpy(out_text, "GA ARM");
+            *out_color = COLOR_AMBER;
+        } else {
+            strcpy(out_text, "ARMED");
+            *out_color = COLOR_GRAY_LT;
+        }
+    } else {
+        // OFF or unknown — banner not shown in SCREEN_OFF anyway
+        out_text[0] = 0;
+        *out_color = COLOR_BLACK;
+    }
+}
+
+// Derives the bottom engagement-row text + color from state alone.
+void derive_engagement_text(const struct DisplayState& s,
+                            char* out_text, uint16_t* out_color) {
+    if (!strcmp(s.state, "OFF")) {
+        strcpy(out_text, "OFF");
+        *out_color = COLOR_GRAY_DK;
+    } else if (!strcmp(s.state, "ARMED")) {
+        strcpy(out_text, "ARMED");
+        *out_color = COLOR_AMBER;
+    } else {
+        // MAN / FLC / TO / GA
+        strcpy(out_text, "ENGAGED");
+        *out_color = COLOR_GREEN;
+    }
+}
+
+// --- Full-screen modes (v0.5.1) ----------------------------------
+
+// Blit logo_bitmap centered at (center_x, center_y). Only called on
+// screen-mode transitions, so blocking SPI burst is acceptable.
+void render_logo(int16_t center_x, int16_t center_y) {
+    int16_t x0 = center_x - LOGO_W / 2;
+    int16_t y0 = center_y - LOGO_H / 2;
+    SPI.beginTransaction(spiSettings);
+    tft_set_window((uint16_t)x0, (uint16_t)y0, LOGO_W, LOGO_H);
+    SPI.endTransaction();
+    tft_write_pixels_bulk(logo_bitmap, LOGO_SIZE);
+}
+
+void render_boot_screen() {
+    tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    render_logo(120, 120);
+}
+
+void render_no_data_screen() {
+    tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    render_logo(120, 90);
+    draw_string_centered(120, 175, "NO DATA", 3, COLOR_AMBER, COLOR_BLACK);
+}
+
+void render_off_screen() {
+    tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    // Intentionally blank per TBM 940 behavior
 }
 
 // --- Per-region renderers -----------------------------------------
 
 void render_mode_label(const struct DisplayState& s) {
-    uint16_t color = color_for_state(s.state);
+    char text[16];
+    uint16_t color;
+    derive_banner_text(s, text, &color);
     tft_fill_rect(0, MODE_Y - 2, 240, MODE_H_PX + 4, COLOR_BLACK);
-    draw_string_centered(120, MODE_Y, display_label(s.state),
-                         MODE_SCALE, color, COLOR_BLACK);
+    if (text[0]) {
+        draw_string_centered(120, MODE_Y, text, MODE_SCALE, color, COLOR_BLACK);
+    }
 }
 
 void render_target_digits(const struct DisplayState& s) {
@@ -512,31 +632,23 @@ void render_ias(const struct DisplayState& s) {
 }
 
 void render_engagement(const struct DisplayState& s) {
-    bool active = state_is_active(s.state);
+    char text[16];
+    uint16_t color;
     bool envelope_alert = strcmp(s.envelope, "OK") != 0;
+    bool active = state_is_active(s.state);
 
-    // Clear the dot + label area
-    tft_fill_rect(80, ENG_DOT_Y - 6, 120, ENG_LBL_SCALE * 7 + 4, COLOR_BLACK);
+    derive_engagement_text(s, text, &color);
 
-    uint16_t dot_color = active ? COLOR_GREEN : COLOR_GRAY_DK;
-    tft_fill_rect(100 - ENG_DOT_R, ENG_DOT_Y - ENG_DOT_R,
-                  2 * ENG_DOT_R, 2 * ENG_DOT_R, dot_color);
-
+    // Envelope alert overrides the ENGAGED label with the alert code in amber
     if (envelope_alert && active) {
-        draw_string(115, ENG_DOT_Y - 6, s.envelope,
-                    ENG_LBL_SCALE, COLOR_AMBER, COLOR_BLACK);
-    } else {
-        draw_string(115, ENG_DOT_Y - 6, "ENG",
-                    ENG_LBL_SCALE, dot_color, COLOR_BLACK);
+        strncpy(text, s.envelope, sizeof(text) - 1);
+        text[sizeof(text) - 1] = 0;
+        color = COLOR_AMBER;
     }
-}
 
-void render_no_data(const struct DisplayState& s) {
-    tft_fill_rect(40, NODATA_Y - 2, 160, 7 + 4, COLOR_BLACK);
-    if (s.no_data) {
-        draw_string_centered(120, NODATA_Y, "NO DATA",
-                             NODATA_SCALE, COLOR_AMBER, COLOR_BLACK);
-    }
+    int16_t band_h = ENG_TEXT_SCALE * 7 + 4;
+    tft_fill_rect(0, ENG_TEXT_Y - 2, 240, band_h, COLOR_BLACK);
+    draw_string_centered(120, ENG_TEXT_Y, text, ENG_TEXT_SCALE, color, COLOR_BLACK);
 }
 
 void render_preselect(const struct DisplayState& s) {
@@ -553,10 +665,11 @@ void render_preselect(const struct DisplayState& s) {
     // Values differ: separator always visible, digits obey flash visibility
     tft_fill_rect(60, SEPARATOR_Y, SEPARATOR_W, SEPARATOR_H, COLOR_GRAY_DK);
 
-    // Preselect color tracks active mode (dim variant)
+    // Preselect color: dim cyan for MAN, light gray for FLC/ARMED/fallback
+    // (FLC switched from dim magenta to gray in v0.5.1 — readability fix)
     uint16_t color;
     if      (!strcmp(s.state, "MAN"))   color = COLOR_CYAN_DIM;
-    else if (!strcmp(s.state, "FLC"))   color = COLOR_MAGENTA_DIM;
+    else if (!strcmp(s.state, "FLC"))   color = COLOR_GRAY_LT;
     else if (!strcmp(s.state, "ARMED")) color = COLOR_GRAY_LT;
     else                                color = COLOR_GRAY_LT;  // OFF/TO/GA fallback
 
@@ -571,54 +684,72 @@ void render_preselect(const struct DisplayState& s) {
     }
 }
 
-// --- Top-level render orchestrator with dirty tracking ------------
+// --- Top-level render orchestrator with screen-mode + dirty tracking ---
+
+// Unconditionally redraws every region of the MAIN layout. Called on
+// transitions into SCREEN_MAIN from another screen mode.
+void render_main_screen_full(const struct DisplayState& s) {
+    tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    render_mode_label(s);
+    render_target_digits(s);
+    render_preselect(s);
+    render_phase(s);
+    render_ias(s);
+    render_engagement(s);
+    rendered_flash_state = preselect_flash_visible;   // sync after full redraw
+}
 
 void render(const struct DisplayState& s, const struct DisplayState& prev) {
-    // Compute per-region dirty flags
+    // Screen-mode transition: full-screen erase + re-render in new mode.
+    if (current_screen != prev_screen) {
+        switch (current_screen) {
+            case SCREEN_BOOT:    render_boot_screen();         break;
+            case SCREEN_NO_DATA: render_no_data_screen();      break;
+            case SCREEN_OFF:     render_off_screen();          break;
+            case SCREEN_MAIN:    render_main_screen_full(s);   break;
+        }
+        prev_screen = current_screen;
+        return;  // no per-region work on transition frame
+    }
+
+    // BOOT / NO_DATA / OFF are static once drawn — nothing to redraw.
+    if (current_screen != SCREEN_MAIN) {
+        return;
+    }
+
+    // SCREEN_MAIN: per-region dirty-tracked redraws only.
     bool state_changed        = strcmp(s.state, prev.state) != 0;
-    bool mode_changed         = strcmp(s.mode, prev.mode) != 0;
     bool target_changed       = s.target != prev.target;
     bool preselected_changed  = s.preselected != prev.preselected;
     bool ias_changed          = s.ias != prev.ias;
     bool phase_changed        = strcmp(s.phase, prev.phase) != 0;
     bool envelope_changed     = strcmp(s.envelope, prev.envelope) != 0;
-    bool nodata_changed       = s.no_data != prev.no_data;
     bool flash_dirty          = preselect_flash_visible != rendered_flash_state;
 
-    // Mode label — redraw on state change (color + label content both depend on state)
-    if (state_changed) {
+    // Banner — state OR phase change (phase affects ARMED+TOGA/GA variants)
+    if (state_changed || phase_changed) {
         render_mode_label(s);
     }
 
-    // Target digits — redraw on state, target, or envelope change (color shift on envelope)
     if (state_changed || target_changed || envelope_changed) {
         render_target_digits(s);
     }
 
-    // Preselect — redraw on state/target/preselected change or flash toggle
     if (state_changed || target_changed || preselected_changed || flash_dirty) {
         render_preselect(s);
         rendered_flash_state = preselect_flash_visible;
     }
 
-    // Phase row — redraw on phase or state change (hidden in OFF/ARMED)
     if (state_changed || phase_changed) {
         render_phase(s);
     }
 
-    // IAS — redraw on change only
     if (ias_changed) {
         render_ias(s);
     }
 
-    // Engagement + envelope label — redraw on state, envelope changes
     if (state_changed || envelope_changed) {
         render_engagement(s);
-    }
-
-    // NO DATA banner — redraw only when flag changes
-    if (nodata_changed) {
-        render_no_data(s);
     }
 }
 
@@ -786,11 +917,9 @@ void handle_line(const char* line) {
     // Valid state message — update PC liveness tracking
     extern uint32_t last_pc_msg_ms;
     extern bool     pc_ever_connected;
-    extern bool     in_demo_mode;
     last_pc_msg_ms = millis();
     pc_ever_connected = true;
-    in_demo_mode = false;  // PC took over, exit demo if we were in it
-    cur_state.no_data = false;  // clear NO DATA overlay
+    cur_state.no_data = false;  // clear NO DATA watchdog flag
 }
 
 void serial_poll() {
@@ -813,47 +942,6 @@ void serial_poll() {
 }
 
 // ====================================================================
-// DEMO CYCLE (only runs if PC never connected within DEMO_START timeout)
-// ====================================================================
-struct DemoFrame {
-    const char* state; const char* mode;
-    int target; int preselected; int ias;
-    const char* phase; const char* envelope;
-    uint32_t hold_ms;
-};
-const DemoFrame demo_seq[] = {
-    // Existing frames — preselected = target so no stacked bug
-    {"OFF",   "-",   0,   0,   0,   "OFF",    "OK",  1500},
-    {"ARMED", "MAN", 180, 180, 120, "OFF",    "OK",  2500},
-    {"MAN",   "MAN", 120, 120, 75,  "CLIMB",  "OK",  2500},
-    {"MAN",   "MAN", 140, 140, 118, "CLIMB",  "OK",  2500},
-    {"FLC",   "FLC", 180, 180, 165, "CLIMB",  "OK",  2500},
-    {"FLC",   "FLC", 220, 220, 198, "CRUISE", "OK",  2500},
-    {"FLC",   "FLC", 220, 220, 235, "CRUISE", "OVR", 2500},   // envelope alert
-    {"TO",    "-",   110, 110, 95,  "TOGA",   "OK",  2500},
-    {"GA",    "-",   130, 130, 115, "GA",     "OK",  2500},
-    {"ARMED", "FLC", 200, 200, 210, "OFF",    "OK",  2500},
-    {"OFF",   "-",   0,   0,   165, "OFF",    "OK",  2000},
-    // v0.5.0 — exercise preselect visual (target != preselected)
-    {"MAN",   "MAN", 180, 195, 175, "CRUISE", "OK",  2500},
-    {"MAN",   "MAN", 195, 195, 192, "CRUISE", "OK",  2000},
-    {"FLC",   "FLC", 220, 240, 235, "CRUISE", "OVR", 2500},
-    {"ARMED", "MAN", 180, 195, 175, "OFF",    "OK",  2500},
-};
-const int demo_count = sizeof(demo_seq) / sizeof(DemoFrame);
-
-void apply_demo_frame(int idx) {
-    const DemoFrame& f = demo_seq[idx];
-    strncpy(cur_state.state,    f.state,    sizeof(cur_state.state) - 1);
-    strncpy(cur_state.mode,     f.mode,     sizeof(cur_state.mode) - 1);
-    cur_state.target      = f.target;
-    cur_state.preselected = f.preselected;
-    cur_state.ias         = f.ias;
-    strncpy(cur_state.phase,    f.phase,    sizeof(cur_state.phase) - 1);
-    strncpy(cur_state.envelope, f.envelope, sizeof(cur_state.envelope) - 1);
-}
-
-// ====================================================================
 // SETUP / LOOP
 // ====================================================================
 uint32_t last_pc_msg_ms    = 0;
@@ -862,10 +950,7 @@ uint32_t last_enc_poll_ms  = 0;
 uint32_t last_btn_change_ms = 0;
 int      last_btn_state    = HIGH;
 int      stable_btn_state  = HIGH;
-uint32_t demo_last_frame_ms = 0;
-int      demo_frame_idx    = 0;
 bool     pc_ever_connected = false;
-bool     in_demo_mode      = false;
 
 // Accumulated detents between emissions
 int32_t inner_accum_raw = 0;
@@ -892,20 +977,26 @@ void poll_encoders() {
     }
 }
 
+// Decides which full-screen mode we should be on this tick. Reads only
+// boot timestamp, pc_ever_connected, cur_state.no_data, and cur_state.state.
+ScreenMode decide_screen_mode(uint32_t now) {
+    if (now - boot_screen_start_ms < BOOT_SCREEN_MS) {
+        return SCREEN_BOOT;
+    }
+    if (!pc_ever_connected || cur_state.no_data) {
+        return SCREEN_NO_DATA;
+    }
+    if (!strcmp(cur_state.state, "OFF")) {
+        return SCREEN_OFF;
+    }
+    return SCREEN_MAIN;
+}
+
 void setup() {
     Serial.begin(250000);
     delay(1000);
 
     tft_init_hw();
-
-    // Splash screen
-    tft_fill_screen(COLOR_BLACK);
-    draw_string_centered(120,  55, "FBSIM",   4, COLOR_CYAN,    COLOR_BLACK);
-    draw_string_centered(120, 105, "AT-DSP",  3, COLOR_WHITE,   COLOR_BLACK);
-    char ver[16];
-    snprintf(ver, sizeof(ver), "V%s", FW_VERSION);
-    draw_string_centered(120, 150, ver, 2, COLOR_GRAY_LT, COLOR_BLACK);
-    delay(1200);
     tft_fill_screen(COLOR_BLACK);
 
     // Encoder + button setup
@@ -914,12 +1005,14 @@ void setup() {
 
     // Emit version immediately so PC knows we're alive
     emit_version();
-    last_heartbeat_ms = millis();
-    last_enc_poll_ms  = millis();
+    last_heartbeat_ms   = millis();
+    last_enc_poll_ms    = millis();
+    boot_screen_start_ms = millis();
 
-    // Initial render of default state
-    render(cur_state, prev_state);
-    prev_state = cur_state;
+    // Force a screen-mode transition on the first loop() iteration so the
+    // boot screen (logo) is rendered via the normal render() path.
+    current_screen = SCREEN_BOOT;
+    prev_screen    = SCREEN_MAIN;
 }
 
 void loop() {
@@ -964,22 +1057,6 @@ void loop() {
         }
     }
 
-    // --- Demo mode management ------------------------------------
-    if (!pc_ever_connected && (now > DEMO_START_IF_NO_PC_MS) && !in_demo_mode) {
-        in_demo_mode = true;
-        demo_frame_idx = 0;
-        demo_last_frame_ms = now;
-        apply_demo_frame(demo_frame_idx);
-    }
-    if (in_demo_mode) {
-        const DemoFrame& f = demo_seq[demo_frame_idx];
-        if (now - demo_last_frame_ms >= f.hold_ms) {
-            demo_frame_idx = (demo_frame_idx + 1) % demo_count;
-            demo_last_frame_ms = now;
-            apply_demo_frame(demo_frame_idx);
-        }
-    }
-
     // --- TIMEOUT detection ---------------------------------------
     if (pc_ever_connected) {
         bool want_no_data = (now - last_pc_msg_ms > TIMEOUT_MS);
@@ -991,8 +1068,12 @@ void loop() {
         }
     }
 
-    // --- Render when state changes -------------------------------
+    // --- Screen-mode decision ------------------------------------
+    current_screen = decide_screen_mode(now);
+
+    // --- Render when something that affects the display changes --
     bool changed =
+        current_screen != prev_screen ||
         strcmp(cur_state.state,    prev_state.state)    != 0 ||
         strcmp(cur_state.mode,     prev_state.mode)     != 0 ||
         cur_state.target      != prev_state.target      ||
