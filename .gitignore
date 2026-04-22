@@ -1,0 +1,11 @@
+build/
+*.hex
+*.bin
+*.elf
+*.map
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+.claude/
