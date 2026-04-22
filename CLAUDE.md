@@ -96,7 +96,7 @@ PC emits compound:
 
 5\. SPI frequency stays at 10 MHz (breadboard margin).
 
-6\. DETENTS\_PER\_COUNT=4 (x4 quadrature decoding). E37 spec-confirmed.
+6\. DETENTS\_PER\_COUNT=2 (verified on hardware 2026-04-22). The E37 variant in use emits 2 pulses per mechanical detent, not 4. Do not change without re-verifying on physical hardware with a known-count test.
 
 7\. Board is DUMB I/O per spec — no local state machine. Encoders emit
 
