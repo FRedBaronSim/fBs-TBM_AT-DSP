@@ -1,5 +1,11 @@
 // ====================================================================
-// FBSiM AT-DSP v0.4.2 — Encoder responsiveness: tighter poll + pre-render drain
+// FBSiM AT-DSP v0.4.3 — Compile fix: auto-prototype rule applied to all
+//                       per-region render helpers
+//
+// Changes from v0.4.2:
+//   - render_mode_label / render_target_digits / render_phase / render_ias /
+//     render_engagement / render_no_data signatures now use
+//     `const struct DisplayState&` (Arduino IDE auto-prototype bug, CLAUDE.md #8)
 //
 // Changes from v0.4.1:
 //   - ENCODER_POLL_MS 10→2 for lower detent latency
@@ -11,7 +17,7 @@
 #include <HardwareTimer.h>
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.4.2";
+static const char* FW_VERSION = "0.4.3";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -418,14 +424,14 @@ const char* display_label(const char* s) {
 
 // --- Per-region renderers -----------------------------------------
 
-void render_mode_label(const DisplayState& s) {
+void render_mode_label(const struct DisplayState& s) {
     uint16_t color = color_for_state(s.state);
     tft_fill_rect(0, MODE_Y - 2, 240, MODE_H_PX + 4, COLOR_BLACK);
     draw_string_centered(120, MODE_Y, display_label(s.state),
                          MODE_SCALE, color, COLOR_BLACK);
 }
 
-void render_target_digits(const DisplayState& s) {
+void render_target_digits(const struct DisplayState& s) {
     bool active = state_is_active(s.state);
     bool armed  = state_is_armed(s.state);
     bool envelope_alert = strcmp(s.envelope, "OK") != 0;
@@ -448,7 +454,7 @@ void render_target_digits(const DisplayState& s) {
     }
 }
 
-void render_phase(const DisplayState& s) {
+void render_phase(const struct DisplayState& s) {
     tft_fill_rect(0, PHASE_Y - 1, 240, PHASE_H_PX + 2, COLOR_BLACK);
     // Don't draw phase for OFF/ARMED (nothing meaningful)
     if (!state_is_active(s.state)) return;
@@ -457,7 +463,7 @@ void render_phase(const DisplayState& s) {
                          COLOR_GRAY_LT, COLOR_BLACK);
 }
 
-void render_ias(const DisplayState& s) {
+void render_ias(const struct DisplayState& s) {
     tft_fill_rect(0, CUR_Y - 2, 240, CUR_H_PX + 4, COLOR_BLACK);
     char buf[16];
     snprintf(buf, sizeof(buf), "IAS %d", s.ias);
@@ -465,7 +471,7 @@ void render_ias(const DisplayState& s) {
                          COLOR_WHITE, COLOR_BLACK);
 }
 
-void render_engagement(const DisplayState& s) {
+void render_engagement(const struct DisplayState& s) {
     bool active = state_is_active(s.state);
     bool envelope_alert = strcmp(s.envelope, "OK") != 0;
 
@@ -485,7 +491,7 @@ void render_engagement(const DisplayState& s) {
     }
 }
 
-void render_no_data(const DisplayState& s) {
+void render_no_data(const struct DisplayState& s) {
     tft_fill_rect(40, NODATA_Y - 2, 160, 7 + 4, COLOR_BLACK);
     if (s.no_data) {
         draw_string_centered(120, NODATA_Y, "NO DATA",
