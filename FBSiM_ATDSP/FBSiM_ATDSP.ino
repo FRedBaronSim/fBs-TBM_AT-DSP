@@ -1,5 +1,30 @@
 // ====================================================================
-// FBSiM AT-DSP v0.5.2 — banner clipping fix (adaptive scale)
+// FBSiM AT-DSP v0.5.3 — NO DATA dot overlay + polish bundle
+//
+// Changes from v0.5.2:
+//   - NO DATA full-screen takeover REMOVED (was too dramatic for brief
+//     USB scheduling hiccups). Replaced with small amber flashing dot
+//     overlay (10px, bottom-right @ (200,200), 1Hz flash).
+//   - SCREEN_NO_DATA mode removed from state machine (3 modes now:
+//     BOOT / OFF / MAIN). "Waiting for PC App" case now shows
+//     SCREEN_OFF (dark) + dot overlay.
+//   - Phase row shows "OFF" in dim gray when phase=OFF (was hidden when
+//     state was OFF/ARMED); TOGA/GA now amber; CLIMB/CRUISE/DESCENT/
+//     APPROACH white. Active-state gate dropped — phase always renders.
+//   - Active digits hidden when mode="-" (TO/GA states, where target-
+//     speed tracking isn't the active control mode).
+//   - ENG_TEXT_Y 200→206: 6px lower to reduce visual crowding against
+//     active digits (v0.5.2 backlog item).
+//   - Default wake mode = MAN (PC App Request 2): purely PC-App-side
+//     change; ATDSP already handled MAN correctly. Documented for
+//     completeness.
+//   - New helpers: render_nodata_dot, update_nodata_dot. Dot renders
+//     via tft_fill_rect 1x1 fallback (no tft_write_pixel helper exists).
+//   - render_no_data_screen() removed.
+//
+// Guiding principle: dark screen = not operational. Main layout =
+// operational. Dot overlay = comms problem. Each visual element has
+// one meaning.
 //
 // Changes from v0.5.1:
 //   - MODE_Y 14→18 (banner shifted down, opens horizontal budget
@@ -65,13 +90,12 @@
 // Declared at file top so Arduino IDE auto-prototypes can resolve the type
 enum ScreenMode {
     SCREEN_BOOT      = 0,   // logo-only, first BOOT_SCREEN_MS after power-on
-    SCREEN_NO_DATA   = 1,   // PC App silent or never connected
-    SCREEN_OFF       = 2,   // PC App reported state=OFF
-    SCREEN_MAIN      = 3    // normal operation (Proposal D layout)
+    SCREEN_OFF       = 1,   // PC App never connected, silent, or reported state=OFF
+    SCREEN_MAIN      = 2    // normal operation (Proposal D layout)
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.2";
+static const char* FW_VERSION = "0.5.3";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -114,6 +138,15 @@ static const uint32_t ENCODER_POLL_MS          = 2;      // hardware counter pol
 static const uint32_t BUTTON_DEBOUNCE_MS       = 20;
 static const uint32_t FLASH_INTERVAL_MS        = 600;    // preselect flash cadence
 #define BOOT_SCREEN_MS 2000                              // logo-only startup hold
+
+// NO DATA dot overlay (v0.5.3). Position (200,200): distance from display
+// center (120,120) is ~113, inside the round viewport radius of 120 with
+// 7px margin. Overlaps the ENG_TEXT clear band (y=204..221) by two rows —
+// handled by dot re-assertion at end of render().
+#define NODATA_DOT_X        200
+#define NODATA_DOT_Y        200
+#define NODATA_DOT_R          5     // 10px diameter (11x11 bbox incl center)
+#define NODATA_FLASH_MS     500     // 500ms on, 500ms off = 1Hz
 
 // ---- Serial buffer -----------------------------------------------
 static const int SERIAL_RX_BUF = 128;
@@ -447,6 +480,13 @@ static ScreenMode current_screen      = SCREEN_BOOT;
 static ScreenMode prev_screen         = SCREEN_BOOT;
 static uint32_t   boot_screen_start_ms = 0;     // set in setup()
 
+// NO DATA dot overlay state (v0.5.3). Runs independently of render() —
+// the dot has its own 1Hz flash cadence and re-asserts itself on top of
+// whatever screen mode is active.
+static bool     nodata_dot_visible    = false;  // currently drawn?
+static bool     nodata_dot_rendered   = false;  // last rendered state
+static uint32_t nodata_dot_toggle_ms  = 0;      // when we last flipped
+
 // ====================================================================
 // LAYOUT CONSTANTS (v0.5.1 Proposal D)
 // ====================================================================
@@ -481,7 +521,7 @@ static uint32_t   boot_screen_start_ms = 0;     // set in setup()
 #define CUR_H_PX          (CUR_SCALE * 7)
 
 // Engagement text (v0.5.1 — replaces the dot + label from v0.5.0)
-#define ENG_TEXT_Y        200
+#define ENG_TEXT_Y        206                 // was 200 — +6 reduces v0.5.2 crowding
 #define ENG_TEXT_SCALE    2
 
 // ====================================================================
@@ -577,15 +617,37 @@ void render_boot_screen() {
     render_logo(120, 120);
 }
 
-void render_no_data_screen() {
-    tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
-    render_logo(120, 90);
-    draw_string_centered(120, 175, "NO DATA", 3, COLOR_AMBER, COLOR_BLACK);
-}
-
 void render_off_screen() {
     tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
     // Intentionally blank per TBM 940 behavior
+}
+
+// --- NO DATA dot overlay (v0.5.3) --------------------------------
+//
+// Draws or erases the amber dot at (NODATA_DOT_X, NODATA_DOT_Y).
+// Called only when visibility state changes. Does not touch the rest
+// of the display — overlay behavior only. The driver lacks a
+// single-pixel-write helper, so we use tft_fill_rect with 1x1 rects
+// inside the circle test. 10px diameter = ~81 rects per toggle at
+// 1Hz; the cost is negligible.
+void render_nodata_dot(bool visible) {
+    // Erase the dot's bounding box first (1px margin each side)
+    int16_t x0 = NODATA_DOT_X - NODATA_DOT_R - 1;
+    int16_t y0 = NODATA_DOT_Y - NODATA_DOT_R - 1;
+    int16_t wh = 2 * (NODATA_DOT_R + 1);
+    tft_fill_rect(x0, y0, wh, wh, COLOR_BLACK);
+
+    if (!visible) return;
+
+    int16_t r2 = NODATA_DOT_R * NODATA_DOT_R;
+    for (int16_t dy = -NODATA_DOT_R; dy <= NODATA_DOT_R; dy++) {
+        for (int16_t dx = -NODATA_DOT_R; dx <= NODATA_DOT_R; dx++) {
+            if (dx * dx + dy * dy <= r2) {
+                tft_fill_rect(NODATA_DOT_X + dx, NODATA_DOT_Y + dy,
+                              1, 1, COLOR_AMBER);
+            }
+        }
+    }
 }
 
 // --- Per-region renderers -----------------------------------------
@@ -602,6 +664,14 @@ void render_mode_label(const struct DisplayState& s) {
 }
 
 void render_target_digits(const struct DisplayState& s) {
+    // TO/GA states use mode="-" because target-speed tracking isn't the
+    // active control mode. Blank the digit region and skip rendering.
+    if (!strcmp(s.mode, "-")) {
+        blank_7seg_area(TGT_RIGHT_X, TGT_Y,
+                        TGT_CELL_W, TGT_CELL_H, TGT_SPACING, 3, COLOR_BLACK);
+        return;
+    }
+
     bool active = state_is_active(s.state);
     bool armed  = state_is_armed(s.state);
     bool envelope_alert = strcmp(s.envelope, "OK") != 0;
@@ -625,12 +695,18 @@ void render_target_digits(const struct DisplayState& s) {
 }
 
 void render_phase(const struct DisplayState& s) {
-    tft_fill_rect(0, PHASE_Y - 1, 240, PHASE_H_PX + 2, COLOR_BLACK);
-    // Don't draw phase for OFF/ARMED (nothing meaningful)
-    if (!state_is_active(s.state)) return;
-    if (!strcmp(s.phase, "OFF") || strlen(s.phase) == 0) return;
-    draw_string_centered(120, PHASE_Y, s.phase, PHASE_SCALE,
-                         COLOR_GRAY_LT, COLOR_BLACK);
+    tft_fill_rect(0, PHASE_Y - 2, 240, PHASE_H_PX + 4, COLOR_BLACK);
+    if (strlen(s.phase) == 0) return;
+
+    uint16_t color;
+    if (!strcmp(s.phase, "OFF")) {
+        color = COLOR_GRAY_DK;                          // dim gray — not operational
+    } else if (!strcmp(s.phase, "TOGA") || !strcmp(s.phase, "GA")) {
+        color = COLOR_AMBER;                            // takeoff / go-around
+    } else {
+        color = COLOR_WHITE;                            // CLIMB/CRUISE/DESCENT/APPROACH
+    }
+    draw_string_centered(120, PHASE_Y, s.phase, PHASE_SCALE, color, COLOR_BLACK);
 }
 
 void render_ias(const struct DisplayState& s) {
@@ -714,15 +790,15 @@ void render(const struct DisplayState& s, const struct DisplayState& prev) {
     if (current_screen != prev_screen) {
         switch (current_screen) {
             case SCREEN_BOOT:    render_boot_screen();         break;
-            case SCREEN_NO_DATA: render_no_data_screen();      break;
             case SCREEN_OFF:     render_off_screen();          break;
             case SCREEN_MAIN:    render_main_screen_full(s);   break;
         }
         prev_screen = current_screen;
-        return;  // no per-region work on transition frame
+        nodata_dot_rendered = false;   // mode-transition wiped the dot
+        return;                         // no per-region work on transition frame
     }
 
-    // BOOT / NO_DATA / OFF are static once drawn — nothing to redraw.
+    // BOOT / OFF are static once drawn — nothing to redraw.
     if (current_screen != SCREEN_MAIN) {
         return;
     }
@@ -760,6 +836,14 @@ void render(const struct DisplayState& s, const struct DisplayState& prev) {
 
     if (state_changed || envelope_changed) {
         render_engagement(s);
+    }
+
+    // Dirty-tracked region renders (notably render_engagement) can wipe
+    // the dot's pixels. Re-assert it here if it was visible before the
+    // render pass. If hardware shows flicker, switch to clearing
+    // nodata_dot_rendered=false and letting update_nodata_dot() redraw.
+    if (nodata_dot_rendered) {
+        render_nodata_dot(true);
     }
 }
 
@@ -988,18 +1072,60 @@ void poll_encoders() {
 }
 
 // Decides which full-screen mode we should be on this tick. Reads only
-// boot timestamp, pc_ever_connected, cur_state.no_data, and cur_state.state.
+// boot timestamp, pc_ever_connected, and cur_state.state.
+//
+// v0.5.3: "no PC App yet" and cur_state.no_data no longer force a
+// full-screen takeover — the dot overlay handles "waiting for comms"
+// signaling on top of whatever mode is active. The dark screen is
+// equivalent for both "never connected" and "OFF" cases: the pilot
+// distinguishes them by the presence of the flashing dot.
 ScreenMode decide_screen_mode(uint32_t now) {
     if (now - boot_screen_start_ms < BOOT_SCREEN_MS) {
         return SCREEN_BOOT;
     }
-    if (!pc_ever_connected || cur_state.no_data) {
-        return SCREEN_NO_DATA;
-    }
-    if (!strcmp(cur_state.state, "OFF")) {
+    if (!pc_ever_connected || !strcmp(cur_state.state, "OFF")) {
         return SCREEN_OFF;
     }
     return SCREEN_MAIN;
+}
+
+// Updates the NO DATA dot flash state. Called every loop() iteration —
+// the dot has its own 1Hz cadence independent of render() calls.
+// Suppressed during the boot splash so the logo stays clean.
+void update_nodata_dot(uint32_t now) {
+    // No dot during the boot splash — keep the logo clean.
+    if (current_screen == SCREEN_BOOT) {
+        if (nodata_dot_rendered) {
+            render_nodata_dot(false);
+            nodata_dot_rendered = false;
+        }
+        nodata_dot_visible = false;
+        return;
+    }
+
+    // Should the dot be flashing at all?
+    bool should_flash = cur_state.no_data || !pc_ever_connected;
+
+    if (!should_flash) {
+        if (nodata_dot_rendered) {
+            render_nodata_dot(false);
+            nodata_dot_rendered = false;
+        }
+        nodata_dot_visible = false;
+        return;
+    }
+
+    // Toggle visibility every NODATA_FLASH_MS
+    if (now - nodata_dot_toggle_ms >= NODATA_FLASH_MS) {
+        nodata_dot_visible   = !nodata_dot_visible;
+        nodata_dot_toggle_ms = now;
+    }
+
+    // Render only if visibility state diverged from what's on screen
+    if (nodata_dot_visible != nodata_dot_rendered) {
+        render_nodata_dot(nodata_dot_visible);
+        nodata_dot_rendered = nodata_dot_visible;
+    }
 }
 
 void setup() {
@@ -1101,6 +1227,11 @@ void loop() {
         render(cur_state, prev_state);
         prev_state = cur_state;
     }
+
+    // --- NO DATA dot overlay (independent 1Hz cadence) -----------
+    // Runs outside the render() "changed" gate because the dot flashes
+    // even when no state change triggers a redraw.
+    update_nodata_dot(now);
 }
 
 // ====================================================================
