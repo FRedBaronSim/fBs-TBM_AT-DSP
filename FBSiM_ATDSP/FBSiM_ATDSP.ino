@@ -1,5 +1,53 @@
 // ====================================================================
-// FBSiM AT-DSP v0.5.3 — NO DATA dot overlay + polish bundle
+// FBSiM AT-DSP v0.5.6 — Display backlight PWM control
+//
+// Changes from v0.5.5:
+//   - Backlight pin (BLK) now driven by PB1 (TIM3_CH4 PWM) instead of
+//     hard-tied to 3.3V. Enables software-controllable display brightness.
+//   - Default brightness: 200/255 (~78%) — adjustable at compile time
+//     via BRIGHTNESS_DEFAULT.
+//   - New helper: set_brightness(uint8_t value) — runtime brightness
+//     setter, also updates current_brightness global for state sync.
+//   - NEW: @ATD:BRT:nnn protocol message — runtime brightness setter
+//     (0-255). Responds with @ATD:BRT:ACK:nnn confirming applied value.
+//   - NEW: @ATD:LOGO protocol message — display logo and hold mode.
+//     Useful for brightness validation and production display testing.
+//     Responds with @ATD:LOGO:ACK. Exit via any state-changing command.
+//     Both originally planned for v0.6.x but added here since
+//     recompile-reflash for brightness validation was impractical.
+//
+// HARDWARE REQUIREMENT: a wire must be added from Black Pill PB1 to
+// display module BLK pin BEFORE this firmware will dim the display.
+// Until that wire exists, the firmware drives PB1 at its PWM duty cycle
+// but the display remains at full brightness (BLK still tied to VIN).
+//
+// PIN CHOICE NOTE (PB1 vs PA8 fallback): PB1 = TIM3_CH4. Inner encoder
+// already puts TIM3 in encoder mode using CH1+CH2 (PB4/PB5). CH4 is an
+// independent capture/compare channel, but STM32 timer encoder mode can
+// affect PWM behavior on other channels of the same timer. If post-flash
+// bench testing shows the PWM doesn't dim OR the inner encoder breaks,
+// fall back to PA8 (TIM1_CH1) in a v0.5.7 hotfix — TIM1 is fully
+// independent of TIM3 and definitively supports PWM.
+//
+// Changes from v0.5.4:
+//   - "1" glyph flag_w reduced from w/3 to w/6. Hardware validation
+//     showed v0.5.4's flag was too wide — combined with the 8px stroke
+//     thickness it visually matched a full SEG_A (top horizontal), so
+//     "180" read as "780" and "111" read as "777". Shorter flag now
+//     reads as an unambiguous tick. TGT cell flag: 13→6px. PRESEL
+//     cell flag: 9→4px.
+//
+// Changes from v0.5.3:
+//   - MODE_SCALE 4→3 (uniform banner size across all states). Eliminates
+//     v0.5.3 hardware-observed crowding between banner bottom and active
+//     digit top. Removes the v0.5.2 adaptive-scale branch (no longer
+//     needed — all banners fit at scale 3). Gains ~7px of breathing
+//     room between banner and target digits.
+//   - "1" digit glyph gains a top flag in draw_7seg_digit(), making
+//     "180" unmistakable from ":80". Fixes v0.5.3 hardware-observed
+//     readability issue with thin-vertical "1" reading as colon.
+//     Flag geometry: (w/3)-wide stroke + t-wide cap atop SEG_B, forming
+//     an L-shape with the vertical. Two-stroke avionics "1" aesthetic.
 //
 // Changes from v0.5.2:
 //   - NO DATA full-screen takeover REMOVED (was too dramatic for brief
@@ -95,12 +143,13 @@ enum ScreenMode {
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.3";
+static const char* FW_VERSION = "0.5.6";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
 #define TFT_DC   PA2
 #define TFT_RST  PB0
+#define DISPLAY_BLK_PIN     PB1     // TIM3_CH4 PWM, 5V-tolerant, near PB0/RST for clean routing
 
 // ---- E37 encoder pins (hardware quadrature) ----------------------
 // TIM2 uses PA0 (CH1) and PA1 (CH2) — outer ring
@@ -138,6 +187,7 @@ static const uint32_t ENCODER_POLL_MS          = 2;      // hardware counter pol
 static const uint32_t BUTTON_DEBOUNCE_MS       = 20;
 static const uint32_t FLASH_INTERVAL_MS        = 600;    // preselect flash cadence
 #define BOOT_SCREEN_MS 2000                              // logo-only startup hold
+#define BRIGHTNESS_DEFAULT  200     // 0-255, ~78% brightness; comfortable bench/cockpit level
 
 // NO DATA dot overlay (v0.5.3). Position (200,200): distance from display
 // center (120,120) is ~113, inside the round viewport radius of 120 with
@@ -323,6 +373,19 @@ void tft_fill_screen(uint16_t color) {
     tft_fill_rect(0, 0, 240, 240, color);
 }
 
+// Display backlight brightness state. Grouped with set_brightness() here
+// (rather than with the render-mode globals further down) so the global
+// is defined before its only mutator — required because set_brightness()
+// lives in this hardware-utilities block.
+static uint8_t current_brightness = BRIGHTNESS_DEFAULT;
+
+// Set display backlight brightness (0=off, 255=full).
+// Stored in current_brightness so any later state changes can re-apply.
+void set_brightness(uint8_t value) {
+    current_brightness = value;
+    analogWrite(DISPLAY_BLK_PIN, value);
+}
+
 // ====================================================================
 // SEVEN-SEGMENT DIGITS
 // ====================================================================
@@ -345,6 +408,17 @@ void draw_7seg_digit(int16_t cx, int16_t cy, int16_t w, int16_t h, int16_t t,
     if (pat & 0x02) tft_fill_rect(cx + w - t,   cy + t,       t, hh - t, fg);
     if (pat & 0x10) tft_fill_rect(cx,           cy + hh + t,  t, hh - t, fg);
     if (pat & 0x04) tft_fill_rect(cx + w - t,   cy + hh + t,  t, hh - t, fg);
+
+    // v0.5.4: top flag on "1" for readability. Hardware validation of
+    // v0.5.3 showed thin-vertical "1" reading as ":" — e.g. "180" as
+    // ":80". Flag spans (w/3)-wide from just-left-of-SEG_B to the right
+    // edge, thickness t, seated at top-of-cell. Adjacent to SEG_B's top
+    // with no gap — forms an L-shape. Proportional to both TGT (w=40)
+    // and PRESEL (w=28) cell sizes.
+    if (digit == 1) {
+        int16_t flag_w = w / 6;   // v0.5.5: was w/3 — shorter tick, not a top-bar
+        tft_fill_rect(cx + w - t - flag_w, cy, flag_w + t, t, fg);
+    }
 }
 
 // Right-aligned integer with leading blanks
@@ -479,6 +553,13 @@ bool     rendered_flash_state      = true;   // what render_preselect last drew
 static ScreenMode current_screen      = SCREEN_BOOT;
 static ScreenMode prev_screen         = SCREEN_BOOT;
 static uint32_t   boot_screen_start_ms = 0;     // set in setup()
+// v0.5.6: @ATD:LOGO hold mode. While true, decide_screen_mode() pins
+// the display to SCREEN_BOOT regardless of the boot-timer / cur_state
+// inputs. Cleared the moment any compound @ATD: state message arrives,
+// so @ATD:OFF / @ATD:MAN / @ATD:FLC etc. exit the hold normally.
+// (Can't pin via boot_screen_start_ms — the now-start<dur comparison
+// underflows when start is in the future, which would exit boot mode.)
+static bool       logo_hold_active     = false;
 
 // NO DATA dot overlay state (v0.5.3). Runs independently of render() —
 // the dot has its own 1Hz flash cadence and re-asserts itself on top of
@@ -491,8 +572,8 @@ static uint32_t nodata_dot_toggle_ms  = 0;      // when we last flipped
 // LAYOUT CONSTANTS (v0.5.1 Proposal D)
 // ====================================================================
 #define MODE_Y            18
-#define MODE_SCALE        4                   // was 3 — bigger banner
-#define MODE_H_PX         (MODE_SCALE * 7)    // 28
+#define MODE_SCALE        3                   // v0.5.4: 4→3 uniform, gains ~7px breathing room
+#define MODE_H_PX         (MODE_SCALE * 7)    // 21
 
 #define TGT_CELL_W        40
 #define TGT_CELL_H        50                  // was 55
@@ -658,8 +739,7 @@ void render_mode_label(const struct DisplayState& s) {
     derive_banner_text(s, text, &color);
     tft_fill_rect(0, MODE_Y - 2, 240, MODE_H_PX + 4, COLOR_BLACK);
     if (text[0]) {
-        uint8_t scale = (strlen(text) >= 6) ? 3 : MODE_SCALE;
-        draw_string_centered(120, MODE_Y, text, scale, color, COLOR_BLACK);
+        draw_string_centered(120, MODE_Y, text, MODE_SCALE, color, COLOR_BLACK);
     }
 }
 
@@ -1002,6 +1082,28 @@ void handle_line(const char* line) {
         return;
     }
 
+    // v0.5.6: @ATD:BRT:nnn — runtime brightness setter (0-255)
+    if (strncmp(payload, "BRT:", 4) == 0) {
+        int value = atoi(payload + 4);
+        if (value < 0)   value = 0;
+        if (value > 255) value = 255;
+        set_brightness((uint8_t)value);
+        Serial.print("@ATD:BRT:ACK:");
+        Serial.println(value);
+        return;
+    }
+
+    // v0.5.6: @ATD:LOGO — render logo and hold (brightness validation target).
+    // Exits when any subsequent compound state message clears logo_hold_active.
+    if (strncmp(payload, "LOGO", 4) == 0) {
+        logo_hold_active = true;
+        current_screen   = SCREEN_BOOT;
+        render_boot_screen();
+        prev_screen      = SCREEN_BOOT;   // suppress redundant transition redraw next tick
+        Serial.println("@ATD:LOGO:ACK");
+        return;
+    }
+
     // Default: attempt to parse as compound state message
     if (!parse_compound_state(payload)) {
         emit_error("PARSE");
@@ -1014,6 +1116,8 @@ void handle_line(const char* line) {
     last_pc_msg_ms = millis();
     pc_ever_connected = true;
     cur_state.no_data = false;  // clear NO DATA watchdog flag
+    // v0.5.6: any successful state message exits @ATD:LOGO hold mode.
+    logo_hold_active = false;
 }
 
 void serial_poll() {
@@ -1080,6 +1184,9 @@ void poll_encoders() {
 // equivalent for both "never connected" and "OFF" cases: the pilot
 // distinguishes them by the presence of the flashing dot.
 ScreenMode decide_screen_mode(uint32_t now) {
+    if (logo_hold_active) {
+        return SCREEN_BOOT;
+    }
     if (now - boot_screen_start_ms < BOOT_SCREEN_MS) {
         return SCREEN_BOOT;
     }
@@ -1134,6 +1241,12 @@ void setup() {
 
     tft_init_hw();
     tft_fill_screen(COLOR_BLACK);
+
+    // Display backlight PWM (v0.5.6). Harmless until BLK is physically
+    // wired from PB1 to the display module — until then this drives an
+    // unconnected pin.
+    pinMode(DISPLAY_BLK_PIN, OUTPUT);
+    set_brightness(BRIGHTNESS_DEFAULT);
 
     // Encoder + button setup
     encoder_init();
