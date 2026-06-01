@@ -1,4 +1,39 @@
 // ====================================================================
+// FBSiM AT-DSP v0.5.7 — TIMEOUT underflow race fix
+//
+// Changes from v0.5.6:
+//   - Fixed TIMEOUT detection underflow race. v0.5.6 captured `now` at
+//     the top of loop() once, then later compared (now - last_pc_msg_ms)
+//     against TIMEOUT_MS. If a valid @ATD: message arrived DURING
+//     serial_poll() (inside the same loop iteration), last_pc_msg_ms
+//     was set to a fresher millis() value than the captured `now`. The
+//     unsigned subtraction then wrapped to ~UINT32_MAX, spuriously
+//     declaring TIMEOUT even though data was flowing normally.
+//
+//   - Fix: use a saturated subtraction that returns 0 when
+//     last_pc_msg_ms > now. Zero msg_age is semantically correct
+//     (message just arrived = fresh data) and prevents the underflow
+//     from triggering false TIMEOUT events.
+//
+// Root cause discovery: v0.5.6-diag1 instrumentation (counters in
+// serial_poll, handle_line, and at TIMEOUT trips) captured the
+// signature: last_msg_age_ms = 4294967295 (0xFFFFFFFF) at every
+// TIMEOUT event, while bytes/prefix/parsed counters incremented
+// steadily through the same window. Data was flowing; the timer
+// was lying. Cross-validated with fBsOperator's host-side heartbeat
+// success counter (climbed steadily through TIMEOUT events).
+//
+// Impact on production: TIMEOUT/RECOVER cycling every ~30 seconds in
+// v0.5.6 production builds when fBsOperator was actively sending its
+// 1 Hz heartbeat. Same-millisecond recovery pattern was the visible
+// symptom (board declared TIMEOUT and immediately undeclared it in
+// the next loop iteration). Cosmetic effect during normal operation,
+// but would have ruined demo video footage (NO DATA dot flashing
+// every ~30s) and confused customers in field deployment.
+//
+// Diagnostic instrumentation from v0.5.6-diag1 removed in this
+// release; v0.5.7 is production-clean.
+// ====================================================================
 // FBSiM AT-DSP v0.5.6 — Display backlight PWM control
 //
 // Changes from v0.5.5:
@@ -143,7 +178,7 @@ enum ScreenMode {
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.6";
+static const char* FW_VERSION = "0.5.7";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -1307,8 +1342,15 @@ void loop() {
     }
 
     // --- TIMEOUT detection ---------------------------------------
+    // v0.5.7: saturated subtraction guards against the case where
+    // last_pc_msg_ms was set inside serial_poll() to a millis() value
+    // LATER than `now` captured at top of loop. In that case, the raw
+    // unsigned subtraction underflows to ~UINT32_MAX, spuriously
+    // triggering TIMEOUT. The saturated form returns 0 when the message
+    // just arrived, which is the correct semantic (zero age = fresh).
     if (pc_ever_connected) {
-        bool want_no_data = (now - last_pc_msg_ms > TIMEOUT_MS);
+        uint32_t msg_age = (now >= last_pc_msg_ms) ? (now - last_pc_msg_ms) : 0;
+        bool want_no_data = (msg_age > TIMEOUT_MS);
         if (want_no_data != cur_state.no_data) {
             cur_state.no_data = want_no_data;
             if (want_no_data) {
