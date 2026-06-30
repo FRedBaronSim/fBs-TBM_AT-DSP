@@ -1,4 +1,24 @@
 // ====================================================================
+// FBSiM AT-DSP v0.5.8 — logo standby on no-feed + preselect render when OFF
+//
+// Changes from v0.5.7:
+//   - decide_screen_mode(): NO FEED (never-connected OR watchdog timeout /
+//     cur_state.no_data) now shows the theFBSiM logo (SCREEN_BOOT reused as
+//     logo standby) instead of a dark screen (never-connected) or a stale
+//     live-looking last frame (timeout). A crashed/disconnected app no longer
+//     leaves "ENGAGED/CLIMB" looking live. Firmware still emits
+//     @ATD:ERR:TIMEOUT on the wire so the PC app keeps its awareness; the
+//     logo is purely the on-glass treatment.
+//   - decide_screen_mode(): when the feed is live and state=OFF, show MAIN
+//     (so a non-zero preselect/target renders) instead of the dark screen.
+//     Dark SCREEN_OFF retained only for OFF with no content (preselect==0 &&
+//     target==0). Enables the pre-arm "set FLC speed on the ground" workflow.
+//   - NO-DATA dot is now dormant (all dot-flash conditions route to the logo
+//     screen, where it is suppressed). Code left in place for a future
+//     cleanup pass.
+//   - Behavior note: powering on with no PC app now shows the logo after the
+//     boot splash (was a dark screen). Intended.
+// ====================================================================
 // FBSiM AT-DSP v0.5.7 — TIMEOUT underflow race fix
 //
 // Changes from v0.5.6:
@@ -178,7 +198,7 @@ enum ScreenMode {
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.7";
+static const char* FW_VERSION = "0.5.8";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -1225,7 +1245,20 @@ ScreenMode decide_screen_mode(uint32_t now) {
     if (now - boot_screen_start_ms < BOOT_SCREEN_MS) {
         return SCREEN_BOOT;
     }
-    if (!pc_ever_connected || !strcmp(cur_state.state, "OFF")) {
+    // v0.5.8: NO FEED -> logo standby. Never-connected, or the watchdog has
+    // tripped (feed stopped), shows the theFBSiM logo instead of a dark
+    // screen or a stale live-looking frame. SCREEN_BOOT is reused as the
+    // logo standby (render_boot_screen draws the logo). The NO-DATA dot is
+    // now dormant: update_nodata_dot() suppresses it on SCREEN_BOOT.
+    if (!pc_ever_connected || cur_state.no_data) {
+        return SCREEN_BOOT;
+    }
+    // v0.5.8: connected + live feed. state=OFF shows the dark SCREEN_OFF
+    // ONLY when there is nothing to display. If a preselect or target is
+    // present (pilot setting the FLC speed on the ground before arming),
+    // show MAIN so the preselect renders -- preselect wins over dark OFF.
+    if (!strcmp(cur_state.state, "OFF") &&
+        cur_state.preselected == 0 && cur_state.target == 0) {
         return SCREEN_OFF;
     }
     return SCREEN_MAIN;
