@@ -1,4 +1,57 @@
 // ====================================================================
+// FBSiM AT-DSP v0.5.10 — power/boot/disengage + display polish + state[] fix
+//
+// Changes from v0.5.9 (@ATD: contract v1.1; app sends target in `active`,
+// plus state=UNPOWERED and state=DISENGAGED):
+//   - FLC-select flash scoped to the digit band (render_flc_target /
+//     render_flc_ias). Fixes the whole-page strobe: FLC label + SEL SPD
+//     are static, IAS updates on change, only the digits flash.
+//   - state=UNPOWERED -> dark; UNPOWERED->powered transition -> 3 s mock
+//     boot (logo + "Booting AT...") then FLC-select; NO FEED -> dark
+//     (reversed from v0.5.8 logo-on-no-feed). Comms blips (no-feed->feed)
+//     do NOT replay the mock boot.
+//   - state=DISENGAGED -> engagement row shows "DISENGAGED" (amber), and
+//     decide_screen_mode keeps the annunciation up instead of dropping
+//     to FLC-select.
+//   - Restored TO ARM / GA ARM in the engagement row: state=ARMED +
+//     phase=TOGA -> "TO ARM" (amber), ARMED+GA -> "GA ARM", ARMED
+//     otherwise -> "ARMED". (Was the old top banner; redesign moved it
+//     to the engagement row.)
+//   - Annunciation target -> large 7-seg digits (reuses TGT_CELL_*);
+//     small "SPD nnn" text retired. CUR_SCALE 2->3. MAIN_TGT_Y /
+//     MAIN_TGT_RIGHT_X bench-tunable.
+//   - FLC-select steady-while-tuning: a target change forces the dial
+//     digits visible + restarts the flash timer, so encoder updates
+//     show immediately (never land in a flash-off blank).
+//   - FIX: DisplayState.state char[8] -> char[12]. char[8] truncated
+//     "UNPOWERED"->"UNPOWER" and "DISENGAGED"->"DISENGA", so every
+//     strcmp against those states failed and the entire UNPOWERED /
+//     DISENGAGED / mock-boot path was silently dead. [12] holds the
+//     longest token + NUL.
+// ====================================================================
+// FBSiM AT-DSP v0.5.9 — two-speed screen redesign + FLC-select standby
+//
+// Changes from v0.5.8:
+//   - Only two speeds shown anywhere: TARGET (active field) and CURRENT/IAS.
+//     The armed-next preselect concept is removed; the preselected field is
+//     no longer rendered by the display.
+//   - Active annunciation: "SPD <target>" atop the phase, then PHASE, IAS,
+//     engagement. Top mode banner, big top target digits, and preselect row
+//     removed. SPD row blanks when target==0 (kills the CLIMB flashing-zero).
+//   - New SCREEN_FLC_SELECT (fed, no active phase): FLC label + big flashing
+//     target digits (the dialed value) + SEL SPD hint + IAS. Replaces the old
+//     dark OFF screen; SCREEN_OFF is now unreachable (dead, later cleanup).
+//   - decide_screen_mode: no-feed->logo (unchanged); no active phase->FLC
+//     select; active phase->annunciation.
+//   - FLASH_INTERVAL_MS 600 -> 250 (faster; now drives the FLC-select target).
+//   - Flash toggle in loop() rescoped to SCREEN_FLC_SELECT only (was
+//     target!=preselected). With preselect not rendered, the old scope
+//     would flip the flag forever on MAIN and dirty-trigger renders every
+//     250ms. FLC-select is now the sole consumer of the flash flag.
+//   - FLC-select shows default 124 (TBM FLC speed) when no target is set,
+//     so the dial screen never shows an empty center on cold boot. Active-
+//     annunciation SPD row still blanks at target==0 (unchanged).
+// ====================================================================
 // FBSiM AT-DSP v0.5.8 — logo standby on no-feed + preselect render when OFF
 //
 // Changes from v0.5.7:
@@ -192,13 +245,15 @@
 
 // Declared at file top so Arduino IDE auto-prototypes can resolve the type
 enum ScreenMode {
-    SCREEN_BOOT      = 0,   // logo-only, first BOOT_SCREEN_MS after power-on
-    SCREEN_OFF       = 1,   // PC App never connected, silent, or reported state=OFF
-    SCREEN_MAIN      = 2    // normal operation (Proposal D layout)
+    SCREEN_BOOT       = 0,   // logo-only power-on splash (first BOOT_SCREEN_MS)
+    SCREEN_OFF        = 1,   // v0.5.10: DARK screen (UNPOWERED / no-feed). render_off_screen() is the dark fill.
+    SCREEN_MAIN       = 2,   // active annunciation (fed + active flight phase)
+    SCREEN_FLC_SELECT = 3,   // fed, no active phase — dial the target speed
+    SCREEN_MOCKBOOT   = 4    // v0.5.10: mock boot (logo + "Booting AT...") on UNPOWERED->powered
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.8";
+static const char* FW_VERSION = "0.5.10";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -240,8 +295,11 @@ static const uint32_t HEARTBEAT_INTERVAL_MS    = 2000;   // send @ATD:ACK
 static const uint32_t TIMEOUT_MS               = 5000;   // PC silent → NO DATA
 static const uint32_t ENCODER_POLL_MS          = 2;      // hardware counter poll
 static const uint32_t BUTTON_DEBOUNCE_MS       = 20;
-static const uint32_t FLASH_INTERVAL_MS        = 600;    // preselect flash cadence
+static const uint32_t FLASH_INTERVAL_MS        = 250;    // v0.5.9: FLC-select target flash (~2 Hz)
 #define BOOT_SCREEN_MS 2000                              // logo-only startup hold
+#define MOCK_BOOT_MS      3000                           // v0.5.10: mock boot hold on battery-on
+#define MOCKBOOT_LOGO_Y   95                             // v0.5.10: logo shifted up to make room for text (bench-tunable)
+#define MOCKBOOT_TEXT_Y   160                            // v0.5.10: "Booting AT..." row (bench-tunable)
 #define BRIGHTNESS_DEFAULT  200     // 0-255, ~78% brightness; comfortable bench/cockpit level
 
 // NO DATA dot overlay (v0.5.3). Position (200,200): distance from display
@@ -586,7 +644,7 @@ void draw_string_centered(int16_t cx, int16_t y, const char* s, uint8_t scale,
 // DISPLAY STATE (what we're currently showing)
 // ====================================================================
 struct DisplayState {
-    char state[8];   // OFF, ARMED, MAN, FLC, TO, GA
+    char state[12];  // OFF/ARMED/MAN/FLC/TO/GA + UNPOWERED(9)/DISENGAGED(10) — must hold the longest token
     char mode[8];    // MAN, FLC, -
     int  target;       // active (committed) value
     int  preselected;  // pilot-dialed, uncommitted value (v0.5.0)
@@ -653,12 +711,30 @@ static uint32_t nodata_dot_toggle_ms  = 0;      // when we last flipped
 #define PHASE_H_PX        (PHASE_SCALE * 7)
 
 #define CUR_Y             176                 // was 168
-#define CUR_SCALE         2
+#define CUR_SCALE         3        // v0.5.10: was 2 — slightly larger current IAS
 #define CUR_H_PX          (CUR_SCALE * 7)
 
 // Engagement text (v0.5.1 — replaces the dot + label from v0.5.0)
 #define ENG_TEXT_Y        206                 // was 200 — +6 reduces v0.5.2 crowding
 #define ENG_TEXT_SCALE    2
+
+// v0.5.10: annunciation target as big 7-seg digits (reuses TGT_CELL_*).
+#define MAIN_TGT_Y        60     // cell top of the big target digits (bench-tunable)
+#define MAIN_TGT_RIGHT_X  190    // was 150 — centers the 3-digit field on the 240px face
+
+// v0.5.9: "SPD nnn" row atop the phase — retired in v0.5.10 (replaced by big 7-seg).
+// Constants left defined (unused, harmless) until a later cleanup pass.
+#define SPD_Y             122
+#define SPD_SCALE         2
+#define SPD_H_PX          (SPD_SCALE * 7)
+
+// v0.5.9: FLC-select screen layout (fed + no active phase). Bench-tunable.
+#define FLC_LABEL_Y       62
+#define FLC_TGT_Y         96
+#define FLC_TGT_RIGHT_X   190    // was 150 — same centering for the FLC-select dial
+#define FLC_HINT_Y        158
+#define FLC_IAS_Y         186
+#define FLC_DEFAULT_SPD   124    // TBM standard FLC/climb speed shown when no target set
 
 // ====================================================================
 // RENDERING (v0.4.1 — per-region dirty tracking, no full wipes)
@@ -679,6 +755,17 @@ bool state_is_active(const char* s) {
 
 bool state_is_armed(const char* s) {
     return !strcmp(s, "ARMED");
+}
+
+// v0.5.9: does the phase field name an active flight phase? Drives the
+// annunciation-vs-FLC-select screen decision. Empty / OFF / "-" mean no
+// phase yet -> FLC select. Everything else (CLIMB/CRUISE/DESCENT/APPROACH/
+// TOGA/GA/LDG) is "active" -> annunciation screen.
+bool phase_is_active(const char* p) {
+    if (p[0] == 0)         return false;
+    if (!strcmp(p, "OFF")) return false;
+    if (!strcmp(p, "-"))   return false;
+    return true;
 }
 
 // --- Banner / engagement text derivation (v0.5.1) -----------------
@@ -726,10 +813,31 @@ void derive_engagement_text(const struct DisplayState& s,
         strcpy(out_text, "OFF");
         *out_color = COLOR_GRAY_DK;
     } else if (!strcmp(s.state, "ARMED")) {
-        strcpy(out_text, "ARMED");
+        // v0.5.10: restore TO ARM / GA ARM (was the old top banner). Shows the
+        // takeoff / go-around arming state after TOGA is pressed. Plain ARMED
+        // for any other armed context. Inert until the app sends the
+        // ARMED+phase=TOGA (or +GA) frame — the bench log went straight from
+        // editing to ENGAGED, so an intermediate "armed for takeoff" frame is
+        // required for this to light up.
+        if (!strcmp(s.phase, "TOGA")) {
+            strcpy(out_text, "TO ARM");
+            *out_color = COLOR_AMBER;
+        } else if (!strcmp(s.phase, "GA")) {
+            strcpy(out_text, "GA ARM");
+            *out_color = COLOR_AMBER;
+        } else {
+            strcpy(out_text, "ARMED");
+            *out_color = COLOR_AMBER;
+        }
+    } else if (!strcmp(s.state, "DISENGAGED")) {
+        // v0.5.10: pilot-ATB kick-off in flight. state_is_active("DISENGAGED")
+        // is false, so the envelope-alert override in render_engagement won't
+        // replace this. "DISENGAGED" = 10 chars * 6 * scale 2 - scale = 120 px,
+        // fits the ~167 px chord at ENG_TEXT_Y=206.
+        strcpy(out_text, "DISENGAGED");
         *out_color = COLOR_AMBER;
     } else {
-        // MAN / FLC / TO / GA
+        // MAN / FLC / TO / GA / ENGAGED
         strcpy(out_text, "ENGAGED");
         *out_color = COLOR_GREEN;
     }
@@ -753,9 +861,55 @@ void render_boot_screen() {
     render_logo(120, 120);
 }
 
+// v0.5.10: dark screen — the live UNPOWERED / no-feed treatment (no longer
+// dead code as of v0.5.9). "Not operational" glass.
 void render_off_screen() {
     tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
-    // Intentionally blank per TBM 940 behavior
+}
+
+// v0.5.10: mock boot — logo (shifted up) + "Booting AT...". Static once drawn
+// (3 s), then decide_screen_mode falls through to FLC-select/annunciation.
+void render_mockboot_screen() {
+    tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    render_logo(120, MOCKBOOT_LOGO_Y);
+    draw_string_centered(120, MOCKBOOT_TEXT_Y, "Booting AT...", 2, COLOR_WHITE, COLOR_BLACK);
+}
+
+// v0.5.10: FLC-select target digits only. Erases just the digit band and
+// redraws the flashing target — so flash toggles no longer strobe the whole
+// page. Default FLC_DEFAULT_SPD when the app hasn't sent a target yet; amber
+// on envelope alert. Called from render_flc_select_screen (transition) and
+// from render()'s non-transition FLC_SELECT block (flash / target / envelope).
+void render_flc_target(const struct DisplayState& s) {
+    tft_fill_rect(0, FLC_TGT_Y - 2, 240, TGT_CELL_H + 4, COLOR_BLACK);
+    if (!preselect_flash_visible) return;        // flash-off: leave band black
+    int spd = (s.target > 0) ? s.target : FLC_DEFAULT_SPD;
+    bool envelope_alert = strcmp(s.envelope, "OK") != 0;
+    uint16_t color = envelope_alert ? COLOR_AMBER : COLOR_WHITE;
+    draw_7seg_number(FLC_TGT_RIGHT_X, FLC_TGT_Y,
+                     TGT_CELL_W, TGT_CELL_H, TGT_CELL_T, TGT_SPACING,
+                     spd, 3, color, COLOR_BLACK);
+}
+
+// v0.5.10: FLC-select IAS row only.
+void render_flc_ias(const struct DisplayState& s) {
+    int16_t band_h = 2 * 7 + 4;                  // scale-2 text band
+    tft_fill_rect(0, FLC_IAS_Y - 2, 240, band_h, COLOR_BLACK);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "IAS %d", s.ias);
+    draw_string_centered(120, FLC_IAS_Y, buf, 2, COLOR_WHITE, COLOR_BLACK);
+}
+
+// v0.5.10: FLC-select standby compositor — full-screen redraw. Runs ONLY on
+// the mode transition; the per-region renderers above handle in-screen
+// updates so the flash toggle no longer strobes the whole page. FLC label
+// and SEL SPD hint are static (drawn once here).
+void render_flc_select_screen(const struct DisplayState& s) {
+    tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    draw_string_centered(120, FLC_LABEL_Y, "FLC", 3, COLOR_MAGENTA, COLOR_BLACK);
+    render_flc_target(s);
+    draw_string_centered(120, FLC_HINT_Y, "SEL SPD", 1, COLOR_GRAY_DK, COLOR_BLACK);
+    render_flc_ias(s);
 }
 
 // --- NO DATA dot overlay (v0.5.3) --------------------------------
@@ -872,6 +1026,21 @@ void render_engagement(const struct DisplayState& s) {
     draw_string_centered(120, ENG_TEXT_Y, text, ENG_TEXT_SCALE, color, COLOR_BLACK);
 }
 
+// v0.5.10: annunciation target as large 7-seg digits (was small "SPD nnn").
+// Blanks at target<=0 (kills flashing-zero). White normally, amber on envelope
+// alert. Steady (does not flash). Reuses the FLC-select 7-seg cell metrics.
+void render_target_spd(const struct DisplayState& s) {
+    tft_fill_rect(0, MAIN_TGT_Y - 2, 240, TGT_CELL_H + 4, COLOR_BLACK);
+    if (s.target <= 0) return;
+
+    bool envelope_alert = strcmp(s.envelope, "OK") != 0;
+    uint16_t color = envelope_alert ? COLOR_AMBER : COLOR_WHITE;
+
+    draw_7seg_number(MAIN_TGT_RIGHT_X, MAIN_TGT_Y,
+                     TGT_CELL_W, TGT_CELL_H, TGT_CELL_T, TGT_SPACING,
+                     s.target, 3, color, COLOR_BLACK);
+}
+
 void render_preselect(const struct DisplayState& s) {
     int16_t total_w = 3 * PRESEL_CELL_W + 2 * PRESEL_SPACING;
     int16_t left_x  = PRESEL_RIGHT_X - total_w;
@@ -907,58 +1076,79 @@ void render_preselect(const struct DisplayState& s) {
 
 // --- Top-level render orchestrator with screen-mode + dirty tracking ---
 
-// Unconditionally redraws every region of the MAIN layout. Called on
-// transitions into SCREEN_MAIN from another screen mode.
+// v0.5.9: annunciation stack. Unconditionally redraws every region of the
+// MAIN layout on transitions into SCREEN_MAIN from another screen mode.
+// The old top mode banner + big top target digits + preselect row are
+// gone; render_mode_label / render_target_digits / render_preselect are
+// left defined (dead code, later cleanup) but no longer called.
+//
+// Deferred to Dustin: with the top mode banner removed, SPD/FLC/TO ARM/
+// GA ARM/ARMED text is no longer displayed. MAN-vs-FLC and TO ARM/GA ARM
+// distinctions come only from the engagement row (ENGAGED/ARMED/OFF) plus
+// the phase text. If a mode indicator is wanted back somewhere, that's a
+// follow-on flash.
 void render_main_screen_full(const struct DisplayState& s) {
     tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
-    render_mode_label(s);
-    render_target_digits(s);
-    render_preselect(s);
+    render_target_spd(s);
     render_phase(s);
     render_ias(s);
     render_engagement(s);
-    rendered_flash_state = preselect_flash_visible;   // sync after full redraw
 }
 
 void render(const struct DisplayState& s, const struct DisplayState& prev) {
     // Screen-mode transition: full-screen erase + re-render in new mode.
     if (current_screen != prev_screen) {
         switch (current_screen) {
-            case SCREEN_BOOT:    render_boot_screen();         break;
-            case SCREEN_OFF:     render_off_screen();          break;
-            case SCREEN_MAIN:    render_main_screen_full(s);   break;
+            case SCREEN_BOOT:        render_boot_screen();            break;
+            case SCREEN_OFF:         render_off_screen();             break;
+            case SCREEN_MAIN:        render_main_screen_full(s);      break;
+            case SCREEN_FLC_SELECT:  render_flc_select_screen(s);     break;
+            case SCREEN_MOCKBOOT:    render_mockboot_screen();        break;
         }
         prev_screen = current_screen;
-        nodata_dot_rendered = false;   // mode-transition wiped the dot
-        return;                         // no per-region work on transition frame
+        rendered_flash_state = preselect_flash_visible;   // sync after full redraw
+        nodata_dot_rendered = false;                      // mode-transition wiped the dot
+        return;                                           // no per-region work on transition frame
     }
 
-    // BOOT / OFF are static once drawn — nothing to redraw.
-    if (current_screen != SCREEN_MAIN) {
+    // BOOT / OFF / MOCKBOOT are static once drawn — nothing to redraw.
+    if (current_screen == SCREEN_BOOT ||
+        current_screen == SCREEN_OFF ||
+        current_screen == SCREEN_MOCKBOOT) {
         return;
     }
 
-    // SCREEN_MAIN: per-region dirty-tracked redraws only.
+    // v0.5.10: SCREEN_FLC_SELECT — per-region redraws. Only the digit band
+    // responds to the flash / target / envelope; IAS row on ias change. FLC
+    // label and SEL SPD hint are static from the transition. Kills the
+    // whole-page strobe at the 250 ms flash cadence.
+    if (current_screen == SCREEN_FLC_SELECT) {
+        bool target_changed   = s.target != prev.target;
+        bool ias_changed      = s.ias != prev.ias;
+        bool envelope_changed = strcmp(s.envelope, prev.envelope) != 0;
+        bool flash_dirty      = preselect_flash_visible != rendered_flash_state;
+        if (flash_dirty || target_changed || envelope_changed) {
+            render_flc_target(s);
+            rendered_flash_state = preselect_flash_visible;
+        }
+        if (ias_changed) {
+            render_flc_ias(s);
+        }
+        return;
+    }
+
+    // SCREEN_MAIN: per-region dirty-tracked redraws. v0.5.9 regions:
+    // target_spd (top), phase, ias, engagement. No more mode_label /
+    // target_digits / preselect.
     bool state_changed        = strcmp(s.state, prev.state) != 0;
     bool target_changed       = s.target != prev.target;
-    bool preselected_changed  = s.preselected != prev.preselected;
     bool ias_changed          = s.ias != prev.ias;
     bool phase_changed        = strcmp(s.phase, prev.phase) != 0;
     bool envelope_changed     = strcmp(s.envelope, prev.envelope) != 0;
-    bool flash_dirty          = preselect_flash_visible != rendered_flash_state;
 
-    // Banner — state OR phase change (phase affects ARMED+TOGA/GA variants)
-    if (state_changed || phase_changed) {
-        render_mode_label(s);
-    }
-
+    // SPD row responds to target, state (blank/color rules), envelope
     if (state_changed || target_changed || envelope_changed) {
-        render_target_digits(s);
-    }
-
-    if (state_changed || target_changed || preselected_changed || flash_dirty) {
-        render_preselect(s);
-        rendered_flash_state = preselect_flash_visible;
+        render_target_spd(s);
     }
 
     if (state_changed || phase_changed) {
@@ -975,8 +1165,7 @@ void render(const struct DisplayState& s, const struct DisplayState& prev) {
 
     // Dirty-tracked region renders (notably render_engagement) can wipe
     // the dot's pixels. Re-assert it here if it was visible before the
-    // render pass. If hardware shows flicker, switch to clearing
-    // nodata_dot_rendered=false and letting update_nodata_dot() redraw.
+    // render pass. NO-DATA dot is dormant in v0.5.9 (routes to logo).
     if (nodata_dot_rendered) {
         render_nodata_dot(true);
     }
@@ -1245,21 +1434,42 @@ ScreenMode decide_screen_mode(uint32_t now) {
     if (now - boot_screen_start_ms < BOOT_SCREEN_MS) {
         return SCREEN_BOOT;
     }
-    // v0.5.8: NO FEED -> logo standby. Never-connected, or the watchdog has
-    // tripped (feed stopped), shows the theFBSiM logo instead of a dark
-    // screen or a stale live-looking frame. SCREEN_BOOT is reused as the
-    // logo standby (render_boot_screen draws the logo). The NO-DATA dot is
-    // now dormant: update_nodata_dot() suppresses it on SCREEN_BOOT.
-    if (!pc_ever_connected || cur_state.no_data) {
-        return SCREEN_BOOT;
+    // --- v0.5.10 power/boot/disengage handling ---
+    static bool     was_unpowered     = false;
+    static uint32_t mock_boot_start   = 0;
+
+    // UNPOWERED (app-signaled battery/avionics off) -> DARK, and arm the
+    // mock boot for the next power-on transition.
+    if (!strcmp(cur_state.state, "UNPOWERED")) {
+        was_unpowered   = true;
+        mock_boot_start = 0;          // cancel any boot in progress
+        return SCREEN_OFF;            // dark
     }
-    // v0.5.8: connected + live feed. state=OFF shows the dark SCREEN_OFF
-    // ONLY when there is nothing to display. If a preselect or target is
-    // present (pilot setting the FLC speed on the ground before arming),
-    // show MAIN so the preselect renders -- preselect wins over dark OFF.
-    if (!strcmp(cur_state.state, "OFF") &&
-        cur_state.preselected == 0 && cur_state.target == 0) {
+
+    // NO FEED -> DARK (v0.5.10: reversed from v0.5.8 logo). Does NOT arm the
+    // mock boot — a comms blip must not replay "Booting AT..." in flight.
+    if (!pc_ever_connected || cur_state.no_data) {
         return SCREEN_OFF;
+    }
+
+    // UNPOWERED -> powered transition: start the 3 s mock boot.
+    if (was_unpowered) {
+        was_unpowered   = false;
+        mock_boot_start = now;
+    }
+    if (mock_boot_start != 0 && (now - mock_boot_start < MOCK_BOOT_MS)) {
+        return SCREEN_MOCKBOOT;
+    }
+    mock_boot_start = 0;
+
+    // DISENGAGED -> keep the annunciation up (never fall to FLC-select).
+    if (!strcmp(cur_state.state, "DISENGAGED")) {
+        return SCREEN_MAIN;
+    }
+
+    // Fed + live: no active phase -> FLC-select; active phase -> annunciation.
+    if (!phase_is_active(cur_state.phase)) {
+        return SCREEN_FLC_SELECT;
     }
     return SCREEN_MAIN;
 }
@@ -1350,9 +1560,27 @@ void loop() {
         poll_encoders();
     }
 
-    // --- Preselect flash toggle ----------------------------------
-    if (cur_state.target != cur_state.preselected &&
-        now - preselect_flash_toggle_ms >= FLASH_INTERVAL_MS) {
+    // --- Flash toggle --------------------------------------------
+    // v0.5.9: FLC-select screen is the sole consumer of this flag now
+    // (preselect row removed). Scoping the toggle to FLC_SELECT prevents
+    // it from perpetually flipping on MAIN and dirty-triggering renders
+    // every FLASH_INTERVAL_MS. current_screen here is set by the previous
+    // loop iteration -- fine; one-iteration lag on flash start/stop is
+    // imperceptible at 250 ms cadence.
+    //
+    // v0.5.10: steady-while-tuning. A target change forces the digits visible
+    // and restarts the flash timer, so an encoder update never lands during a
+    // flash-off blank (would hide it up to FLASH_INTERVAL_MS). Blink resumes
+    // after FLASH_INTERVAL_MS with no change. prev_state.target still holds the
+    // last-rendered value here (prev_state syncs later in the render() "changed"
+    // block), so the compare is correct and fires once per change.
+    if (current_screen == SCREEN_FLC_SELECT &&
+        cur_state.target != prev_state.target) {
+        preselect_flash_visible   = true;
+        preselect_flash_toggle_ms = now;
+    }
+    else if (current_screen == SCREEN_FLC_SELECT &&
+             now - preselect_flash_toggle_ms >= FLASH_INTERVAL_MS) {
         preselect_flash_visible = !preselect_flash_visible;
         preselect_flash_toggle_ms = now;
     }
