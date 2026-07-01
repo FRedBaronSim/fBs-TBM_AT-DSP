@@ -1,4 +1,14 @@
 // ====================================================================
+// FBSiM AT-DSP v0.5.11 — annunciation layout rebalance
+//
+// Changes from v0.5.10:
+//   - Tighten the annunciation stack under the hero target. Phase up:
+//     PHASE_Y 150 -> 130 (under the hero number). IAS grown + raised:
+//     CUR_SCALE 3 -> 4, CUR_Y 176 -> 162 (second-most-prominent readout).
+//     Engagement nudged up: ENG_TEXT_Y 206 -> 202. Hero target and both
+//     _SCALE-derived erase bands unchanged; constants-only, no render
+//     changes.
+// ====================================================================
 // FBSiM AT-DSP v0.5.10 — power/boot/disengage + display polish + state[] fix
 //
 // Changes from v0.5.9 (@ATD: contract v1.1; app sends target in `active`,
@@ -253,7 +263,7 @@ enum ScreenMode {
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.10";
+static const char* FW_VERSION = "0.5.11";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -706,16 +716,16 @@ static uint32_t nodata_dot_toggle_ms  = 0;      // when we last flipped
 #define PRESEL_Y          110
 #define PRESEL_RIGHT_X    167
 
-#define PHASE_Y           150                 // was 152
+#define PHASE_Y           130    // v0.5.10 tuning: was 150 — up under the hero target
 #define PHASE_SCALE       3                   // was 1 — much more visible
 #define PHASE_H_PX        (PHASE_SCALE * 7)
 
-#define CUR_Y             176                 // was 168
-#define CUR_SCALE         3        // v0.5.10: was 2 — slightly larger current IAS
+#define CUR_Y             162    // v0.5.10 tuning: was 176 — raised to fit the larger IAS
+#define CUR_SCALE         4      // v0.5.10 tuning: was 3 — live IAS now second-most prominent
 #define CUR_H_PX          (CUR_SCALE * 7)
 
 // Engagement text (v0.5.1 — replaces the dot + label from v0.5.0)
-#define ENG_TEXT_Y        206                 // was 200 — +6 reduces v0.5.2 crowding
+#define ENG_TEXT_Y        202    // v0.5.10 tuning: was 206 — small nudge up for even spacing
 #define ENG_TEXT_SCALE    2
 
 // v0.5.10: annunciation target as big 7-seg digits (reuses TGT_CELL_*).
