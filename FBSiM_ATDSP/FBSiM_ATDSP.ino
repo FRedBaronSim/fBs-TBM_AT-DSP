@@ -1,4 +1,20 @@
 // ====================================================================
+// FBSiM AT-DSP v0.5.12 — FMS/MAN source selector
+//
+// Changes from v0.5.11:
+//   - New FMS/MAN speed-source selector pill in the top arc, on both the
+//     annunciation and FLC-select screens. FMS = left half, MAN = right
+//     half; the active half gets a dim source-color fill (position cue),
+//     active label bright, inactive label dim gray.
+//   - Driven entirely by the `mode` field (previously parsed but unrendered):
+//     mode=="FMS" -> magenta, anything else -> cyan (MAN default). The app
+//     owns the source and echoes `mode`; the display never toggles locally.
+//   - Hero target number and FLC-select dial digits now colored by source
+//     (cyan MAN / magenta FMS) instead of white; envelope-alert amber still
+//     overrides. New helpers source_is_fms() / source_color(); new color
+//     COLOR_MAGENTA_DIM; new bench-tunable SEL_* constants.
+//   - `state`, the parser, and decide_screen_mode() are unchanged.
+// ====================================================================
 // FBSiM AT-DSP v0.5.11 — annunciation layout rebalance
 //
 // Changes from v0.5.10:
@@ -263,7 +279,7 @@ enum ScreenMode {
 };
 
 // ---- Version ------------------------------------------------------
-static const char* FW_VERSION = "0.5.11";
+static const char* FW_VERSION = "0.5.12";
 
 // ---- Display pins -------------------------------------------------
 #define TFT_CS   PA3
@@ -290,6 +306,7 @@ SPISettings spiSettings(10000000, MSBFIRST, SPI_MODE0);
 #define COLOR_CYAN     0x07FF
 #define COLOR_CYAN_DIM    0x043F   // preselect cyan (MAN preselect)
 #define COLOR_MAGENTA  0xF81F
+#define COLOR_MAGENTA_DIM 0x8010   // v0.5.12: dim magenta — FMS selector half fill (bench-tunable shade)
 #define COLOR_GREEN    0x07E0
 #define COLOR_AMBER    0xFD20   // G3000 caution amber
 #define COLOR_RED      0xF800
@@ -730,6 +747,16 @@ static uint32_t nodata_dot_toggle_ms  = 0;      // when we last flipped
 
 // v0.5.10: annunciation target as big 7-seg digits (reuses TGT_CELL_*).
 #define MAIN_TGT_Y        60     // cell top of the big target digits (bench-tunable)
+
+// v0.5.12: FMS/MAN source selector pill (top arc). FMS = left half, MAN = right
+// half (matches the real GMC SPD knob). Active half gets a dim source-color
+// fill (the position cue); active label bright, inactive label dim. All tunable.
+#define SEL_CX       120    // pill center X (face center)
+#define SEL_W        116    // total pill width; each half = SEL_W/2
+#define SEL_Y        28     // pill top Y (above the hero target at MAIN_TGT_Y=60)
+#define SEL_H        24     // pill height
+#define SEL_SCALE    2      // label text scale (5x7 font)
+#define SEL_LABEL_Y  33     // label top Y (vertically centered in the pill band)
 #define MAIN_TGT_RIGHT_X  190    // was 150 — centers the 3-digit field on the 240px face
 
 // v0.5.9: "SPD nnn" row atop the phase — retired in v0.5.10 (replaced by big 7-seg).
@@ -756,6 +783,17 @@ uint16_t color_for_state(const char* s) {
     if (!strcmp(s, "GA"))    return COLOR_GREEN;
     if (!strcmp(s, "ARMED")) return COLOR_WHITE;
     return COLOR_GRAY_LT;   // OFF and default
+}
+
+// v0.5.12: SPD source, read from the `mode` field. FMS -> magenta, everything
+// else -> cyan (MAN is the safe default, so legacy mode values "FLC"/"-" read
+// as MAN). The `mode` field is otherwise unrendered. See the PC App contract
+// FYI (2026-07-02 v2).
+bool source_is_fms(const char* mode) {
+    return !strcmp(mode, "FMS");
+}
+uint16_t source_color(const char* mode) {
+    return source_is_fms(mode) ? COLOR_MAGENTA : COLOR_CYAN;
 }
 
 bool state_is_active(const char* s) {
@@ -895,7 +933,7 @@ void render_flc_target(const struct DisplayState& s) {
     if (!preselect_flash_visible) return;        // flash-off: leave band black
     int spd = (s.target > 0) ? s.target : FLC_DEFAULT_SPD;
     bool envelope_alert = strcmp(s.envelope, "OK") != 0;
-    uint16_t color = envelope_alert ? COLOR_AMBER : COLOR_WHITE;
+    uint16_t color = envelope_alert ? COLOR_AMBER : source_color(s.mode);
     draw_7seg_number(FLC_TGT_RIGHT_X, FLC_TGT_Y,
                      TGT_CELL_W, TGT_CELL_H, TGT_CELL_T, TGT_SPACING,
                      spd, 3, color, COLOR_BLACK);
@@ -916,6 +954,7 @@ void render_flc_ias(const struct DisplayState& s) {
 // and SEL SPD hint are static (drawn once here).
 void render_flc_select_screen(const struct DisplayState& s) {
     tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    render_source_selector(s);
     draw_string_centered(120, FLC_LABEL_Y, "FLC", 3, COLOR_MAGENTA, COLOR_BLACK);
     render_flc_target(s);
     draw_string_centered(120, FLC_HINT_Y, "SEL SPD", 1, COLOR_GRAY_DK, COLOR_BLACK);
@@ -1039,12 +1078,43 @@ void render_engagement(const struct DisplayState& s) {
 // v0.5.10: annunciation target as large 7-seg digits (was small "SPD nnn").
 // Blanks at target<=0 (kills flashing-zero). White normally, amber on envelope
 // alert. Steady (does not flash). Reuses the FLC-select 7-seg cell metrics.
+// v0.5.12: draw the FMS/MAN source pill in the top arc. Driven entirely by the
+// mode field — the display never toggles it locally (the app owns the source
+// and echoes `mode` back on a ring turn). `struct` keyword required in the sig.
+void render_source_selector(const struct DisplayState& s) {
+    tft_fill_rect(0, SEL_Y - 2, 240, SEL_H + 4, COLOR_BLACK);   // erase band
+
+    bool fms   = source_is_fms(s.mode);
+    int  halfW = SEL_W / 2;
+    int  leftX = SEL_CX - halfW;        // left edge of the FMS half
+
+    // Active half: dim source-color fill = the fast position cue
+    if (fms) {
+        tft_fill_rect(leftX,  SEL_Y, halfW, SEL_H, COLOR_MAGENTA_DIM);   // FMS (left)
+    } else {
+        tft_fill_rect(SEL_CX, SEL_Y, halfW, SEL_H, COLOR_CYAN_DIM);      // MAN (right)
+    }
+
+    // Divider between the halves
+    tft_fill_rect(SEL_CX, SEL_Y, 1, SEL_H, COLOR_GRAY_DK);
+
+    // Labels: active bright in source color, inactive dim gray. Each label's bg
+    // matches the fill beneath it so the glyph cells blend into the half.
+    uint16_t fms_fg = fms ? COLOR_MAGENTA     : COLOR_GRAY_DK;
+    uint16_t man_fg = fms ? COLOR_GRAY_DK     : COLOR_CYAN;
+    uint16_t fms_bg = fms ? COLOR_MAGENTA_DIM : COLOR_BLACK;
+    uint16_t man_bg = fms ? COLOR_BLACK       : COLOR_CYAN_DIM;
+
+    draw_string_centered(SEL_CX - halfW / 2, SEL_LABEL_Y, "FMS", SEL_SCALE, fms_fg, fms_bg);
+    draw_string_centered(SEL_CX + halfW / 2, SEL_LABEL_Y, "MAN", SEL_SCALE, man_fg, man_bg);
+}
+
 void render_target_spd(const struct DisplayState& s) {
     tft_fill_rect(0, MAIN_TGT_Y - 2, 240, TGT_CELL_H + 4, COLOR_BLACK);
     if (s.target <= 0) return;
 
     bool envelope_alert = strcmp(s.envelope, "OK") != 0;
-    uint16_t color = envelope_alert ? COLOR_AMBER : COLOR_WHITE;
+    uint16_t color = envelope_alert ? COLOR_AMBER : source_color(s.mode);
 
     draw_7seg_number(MAIN_TGT_RIGHT_X, MAIN_TGT_Y,
                      TGT_CELL_W, TGT_CELL_H, TGT_CELL_T, TGT_SPACING,
@@ -1099,6 +1169,7 @@ void render_preselect(const struct DisplayState& s) {
 // follow-on flash.
 void render_main_screen_full(const struct DisplayState& s) {
     tft_fill_rect(0, 0, 240, 240, COLOR_BLACK);
+    render_source_selector(s);
     render_target_spd(s);
     render_phase(s);
     render_ias(s);
@@ -1136,10 +1207,14 @@ void render(const struct DisplayState& s, const struct DisplayState& prev) {
         bool target_changed   = s.target != prev.target;
         bool ias_changed      = s.ias != prev.ias;
         bool envelope_changed = strcmp(s.envelope, prev.envelope) != 0;
+        bool mode_changed     = strcmp(s.mode, prev.mode) != 0;
         bool flash_dirty      = preselect_flash_visible != rendered_flash_state;
-        if (flash_dirty || target_changed || envelope_changed) {
+        if (flash_dirty || target_changed || envelope_changed || mode_changed) {
             render_flc_target(s);
             rendered_flash_state = preselect_flash_visible;
+        }
+        if (mode_changed) {
+            render_source_selector(s);
         }
         if (ias_changed) {
             render_flc_ias(s);
@@ -1155,9 +1230,15 @@ void render(const struct DisplayState& s, const struct DisplayState& prev) {
     bool ias_changed          = s.ias != prev.ias;
     bool phase_changed        = strcmp(s.phase, prev.phase) != 0;
     bool envelope_changed     = strcmp(s.envelope, prev.envelope) != 0;
+    bool mode_changed         = strcmp(s.mode, prev.mode) != 0;
 
-    // SPD row responds to target, state (blank/color rules), envelope
-    if (state_changed || target_changed || envelope_changed) {
+    // Source selector (top arc) repaints when the SPD source changes
+    if (mode_changed) {
+        render_source_selector(s);
+    }
+
+    // SPD row responds to target, state (blank/color rules), envelope, source color
+    if (state_changed || target_changed || envelope_changed || mode_changed) {
         render_target_spd(s);
     }
 
